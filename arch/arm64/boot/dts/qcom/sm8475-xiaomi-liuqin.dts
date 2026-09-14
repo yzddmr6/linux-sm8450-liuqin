@@ -198,9 +198,11 @@
 
 	/*
 	 * The charger PD runs on ADSP and publishes PMIC_RTR_ADSP_APPS, exactly
-	 * as the vendor FDT describes. Keep USB role wiring out of this first
-	 * step: battmgr and UCSI may report state, while the already-validated
-	 * DWC3 peripheral gadget remains the only control/data path.
+	 * as the vendor FDT describes.  The connector is now wired through as
+	 * well: pmic-glink UCSI reports the data role and CC orientation, the
+	 * DWC3 follows it as an OTG dual-role port, and the QMP combo PHY takes
+	 * the orientation for its lane swap (vendor routes the CC orientation
+	 * line to TLMM gpio91).
 	 */
 	pmic-glink {
 		compatible = "qcom,sm8475-pmic-glink",
@@ -208,6 +210,38 @@
 			     "qcom,pmic-glink";
 		#address-cells = <1>;
 		#size-cells = <0>;
+
+		orientation-gpios = <&tlmm 91 GPIO_ACTIVE_HIGH>;
+		pinctrl-0 = <&usb3_orient_default>;
+		pinctrl-names = "default";
+
+		connector@0 {
+			compatible = "usb-c-connector";
+			reg = <0>;
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+
+					pmic_glink_hs_in: endpoint {
+						remote-endpoint = <&usb_1_dwc3_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+
+					pmic_glink_ss_in: endpoint {
+						remote-endpoint = <&usb_1_qmpphy_out>;
+					};
+				};
+			};
+		};
 	};
 
 	reserved-memory {
@@ -463,6 +497,17 @@
 			regulator-name = "pm8350_l9";
 			regulator-min-microvolt = <1200000>;
 			regulator-max-microvolt = <1304000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		/*
+		 * USB3 QMP combo PHY PLL rail. The vendor names L1B as the
+		 * ssphy vdd-supply at 0.912 V (vendor FDT usb_qmp_dp_phy).
+		 */
+		pm8350_l1: ldo1 {
+			regulator-name = "pm8350_l1";
+			regulator-min-microvolt = <912000>;
+			regulator-max-microvolt = <912000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 	};
@@ -1170,6 +1215,14 @@
 	gpio-reserved-ranges = <28 4>, <36 4>;
 	status = "okay";
 
+	/* Type-C CC orientation line into the QMP lane-swap decision. */
+	usb3_orient_default: usb3-orient-state {
+		pins = "gpio91";
+		function = "gpio";
+		bias-disable;
+		input-enable;
+	};
+
 	/*
 	 * The QCA6490 enable lines come up deasserted and are raised by the
 	 * power sequencer when a radio is actually claimed. Levels, direction
@@ -1478,15 +1531,21 @@
 };
 
 &usb_1 {
-	qcom,select-utmi-as-pipe-clk;
+	/* select-utmi-as-pipe-clk removed: it waives the QMP pipe clock and is
+	 * only valid for USB2-only operation. */
 	status = "okay";
 };
 
 &usb_1_dwc3 {
-	dr_mode = "peripheral";
-	maximum-speed = "high-speed";
-	phys = <&usb_1_hsphy>;
-	phy-names = "usb2-phy";
+	dr_mode = "otg";
+	usb-role-switch;
+	maximum-speed = "super-speed";
+	phys = <&usb_1_hsphy>, <&usb_1_qmpphy QMP_USB43DP_USB3_PHY>;
+	phy-names = "usb2-phy", "usb3-phy";
+};
+
+&usb_1_dwc3_hs {
+	remote-endpoint = <&pmic_glink_hs_in>;
 };
 
 &usb_1_hsphy {
@@ -1495,4 +1554,15 @@
 	phys = <&nxp_eusb2_repeater>;
 
 	status = "okay";
+};
+
+&usb_1_qmpphy {
+	status = "okay";
+
+	vdda-phy-supply = <&pm8350c_l10>;
+	vdda-pll-supply = <&pm8350_l1>;
+};
+
+&usb_1_qmpphy_out {
+	remote-endpoint = <&pmic_glink_ss_in>;
 };
