@@ -26,6 +26,8 @@
 #include <linux/debugfs.h>
 #include <linux/of_gpio.h>
 #include <linux/of_irq.h>
+#include <linux/init.h>
+#include <linux/string.h>
 
 #include "nt36xxx.h"
 
@@ -761,6 +763,23 @@ static int32_t nvt_parse_dt(struct device *dev)
 	if (ret) {
 		NVT_LOG("Unable to get touchscreen firmware name\n");
 		ts->fw_name = DEFAULT_BOOT_UPDATE_FIRMWARE_NAME;
+	}
+
+	/*
+	 * liuqin (Xiaomi Pad 6 Pro) fits one of two NT36532 panel modules and
+	 * the touch firmware is not interchangeable: loading the other
+	 * module's firmware mirrors one half of the touchscreen.  The
+	 * bootloader names the fitted display module on the kernel command
+	 * line, so choose the firmware from there:
+	 *   m81_36_02_0a -> Tianma (tm)
+	 *   m81_42_02_0b -> CSOT   (csot)
+	 * An unrecognised module keeps the firmware-name from the DT.
+	 */
+	if (saved_command_line) {
+		if (strstr(saved_command_line, "mdss_dsi_m81_36_02_0a"))
+			ts->fw_name = LIUQIN_TOUCH_FW_TM;
+		else if (strstr(saved_command_line, "mdss_dsi_m81_42_02_0b"))
+			ts->fw_name = LIUQIN_TOUCH_FW_CSOT;
 	}
 
 	ret = of_property_read_u32(np, "spi-max-frequency", &ts->spi_max_freq);

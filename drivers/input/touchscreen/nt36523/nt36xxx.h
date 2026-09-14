@@ -101,6 +101,16 @@ extern const uint16_t touch_key_array[TOUCH_KEY_NUM];
 #define DEFAULT_BOOT_UPDATE_FIRMWARE_NAME "novatek/nt36523.bin"
 #define DEFAULT_MP_UPDATE_FIRMWARE_NAME   "novatek_ts_mp.bin"
 
+/*
+ * liuqin (Xiaomi Pad 6 Pro) ships two NT36532 panel modules whose touch
+ * firmware is not interchangeable: loading the wrong one mirrors one half of
+ * the panel.  The module fitted to the running unit is named on the kernel
+ * command line as msm_drm.dsi_display0=qcom,mdss_dsi_<module>_..., so the
+ * driver selects the firmware from that name instead of a single fixed path.
+ */
+#define LIUQIN_TOUCH_FW_CSOT "novatek/liuqin/novatek_nt36532_m81_fw_csot.bin"
+#define LIUQIN_TOUCH_FW_TM   "novatek/liuqin/novatek_nt36532_m81_fw_tm.bin"
+
 //---ESD Protect.---
 #define NVT_TOUCH_ESD_PROTECT 1
 #define NVT_TOUCH_ESD_CHECK_PERIOD 1500	/* ms */
