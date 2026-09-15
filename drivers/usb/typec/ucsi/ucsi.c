@@ -1345,6 +1345,8 @@ static int ucsi_reset_ppm(struct ucsi *ucsi)
 	u64 command;
 	unsigned long tmo;
 	u32 cci;
+	u32 cci_entry = 0;
+	int resends = 0;
 	int ret;
 
 	mutex_lock(&ucsi->ppm_lock);
@@ -1352,6 +1354,27 @@ static int ucsi_reset_ppm(struct ucsi *ucsi)
 	ret = ucsi->ops->poll_cci(ucsi, &cci);
 	if (ret < 0)
 		goto out;
+	cci_entry = cci;
+
+	/*
+	 * A command whose acknowledgement was never consumed leaves this PPM
+	 * holding CCI (ACK_COMPLETE latched) and it then silently ignores
+	 * PPM_RESET. This happens when an earlier init attempt bailed out
+	 * after its last sync command (e.g. connector registration deferred
+	 * because the USB role switch was not registered yet). Acknowledge
+	 * stale command indications first; best effort, like the prelude
+	 * below. Bypasses ucsi_send_command() which takes ppm_lock.
+	 */
+	if (cci & (UCSI_CCI_ACK_COMPLETE | UCSI_CCI_COMMAND_COMPLETE)) {
+		command = UCSI_ACK_CC_CI | UCSI_ACK_COMMAND_COMPLETE;
+		ret = ucsi->ops->sync_control(ucsi, command, NULL, NULL, 0);
+		dev_dbg(ucsi->dev, "ppm_reset: stale ack cci=0x%x, ack ret=%d\n",
+			 cci, ret);
+		ret = ucsi->ops->poll_cci(ucsi, &cci);
+		if (ret < 0)
+			goto out;
+		dev_dbg(ucsi->dev, "ppm_reset: after stale ack cci=0x%x\n", cci);
+	}
 
 	/*
 	 * If UCSI_CCI_RESET_COMPLETE is already set we must clear
@@ -1378,6 +1401,8 @@ static int ucsi_reset_ppm(struct ucsi *ucsi)
 		} while (1);
 
 		WARN_ON(cci & UCSI_CCI_RESET_COMPLETE);
+		dev_dbg(ucsi->dev, "ppm_reset prelude: entry cci=0x%x after-sne cci=0x%x\n",
+			 cci_entry, cci);
 	}
 
 	command = UCSI_PPM_RESET;
@@ -1389,6 +1414,8 @@ static int ucsi_reset_ppm(struct ucsi *ucsi)
 
 	do {
 		if (time_is_before_jiffies(tmo)) {
+			dev_err(ucsi->dev, "ppm_reset timeout: entry cci=0x%x final cci=0x%x resends=%d\n",
+				cci_entry, cci, resends);
 			ret = -ETIMEDOUT;
 			goto out;
 		}
@@ -1400,15 +1427,18 @@ static int ucsi_reset_ppm(struct ucsi *ucsi)
 		if (ret)
 			goto out;
 
-		/* If the PPM is still doing something else, reset it again. */
-		if (cci & ~UCSI_CCI_RESET_COMPLETE) {
-			ret = ucsi->ops->async_control(ucsi, command);
-			if (ret < 0)
-				goto out;
-		}
+		/*
+		 * Do not resend PPM_RESET while waiting: this PPM stalls
+		 * when RESET is hammered while it is still finishing the
+		 * previous command, and repeated resends wedge its UCSI
+		 * server for the rest of the boot. Wait for RESET_COMPLETE
+		 * and ignore any other CCI bits meanwhile.
+		 */
 
 	} while (!(cci & UCSI_CCI_RESET_COMPLETE));
 
+	dev_dbg(ucsi->dev, "ppm_reset done: entry cci=0x%x final cci=0x%x resends=%d\n",
+		 cci_entry, cci, resends);
 out:
 	mutex_unlock(&ucsi->ppm_lock);
 	return ret;
@@ -1890,7 +1920,7 @@ static void ucsi_init_work(struct work_struct *work)
 	if (ret)
 		dev_err_probe(ucsi->dev, ret, "PPM init failed\n");
 
-	if (ret == -EPROBE_DEFER) {
+	if (ret == -EPROBE_DEFER || ret == -ETIMEDOUT) {
 		if (ucsi->work_count++ > UCSI_ROLE_SWITCH_WAIT_COUNT) {
 			dev_err(ucsi->dev, "PPM init failed, stop trying\n");
 			return;
