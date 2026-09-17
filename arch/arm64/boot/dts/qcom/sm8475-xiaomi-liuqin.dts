@@ -974,6 +974,11 @@
 	status = "okay";
 };
 
+/* SWR pinctrl states live under the LPASS-local TLMM; it must probe first. */
+&lpass_tlmm {
+	status = "okay";
+};
+
 &rxmacro {
 	status = "okay";
 };
