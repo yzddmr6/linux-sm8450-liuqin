@@ -147,6 +147,37 @@
 		regulator-always-on;
 	};
 
+	/*
+	 * Onboard microphones: four analog MEMS mics on WCD938x AMIC1/3/4/5,
+	 * carried over SoundWire to the TX macro (vendor sku_cape mixer paths:
+	 * handset-mic->amic1, speaker-mic->amic5, back-mic->amic4,
+	 * sidebottom-mic->amic3).  The vendor's swr-dmic nodes and DMIC
+	 * pinctrls are all disabled in the ABL-final FDT -- there is no
+	 * AP-visible digital mic.  Supplies/reset/micbias from the vendor
+	 * wcd938x-codec node (abl-final-fdt.dts:32298-32346).  No MBHC: this
+	 * tablet has no headset jack.  See docs/features/audio-mic.zh-CN.md.
+	 */
+	wcd938x: audio-codec {
+		compatible = "qcom,wcd9380-codec";
+
+		reset-gpios = <&tlmm 43 GPIO_ACTIVE_LOW>;
+
+		vdd-buck-supply = <&pm8350_s10>;
+		vdd-rxtx-supply = <&pm8350_s10>;
+		vdd-io-supply = <&pm8350_s10>;
+		vdd-mic-bias-supply = <&pm8350c_bob>;
+
+		qcom,micbias1-microvolt = <2750000>;
+		qcom,micbias2-microvolt = <2750000>;
+		qcom,micbias3-microvolt = <2750000>;
+		qcom,micbias4-microvolt = <2750000>;
+
+		qcom,rx-device = <&wcd_rx>;
+		qcom,tx-device = <&wcd_tx>;
+
+		#sound-dai-cells = <1>;
+	};
+
 	gpio-keys {
 		compatible = "gpio-keys";
 
@@ -524,6 +555,16 @@
 		};
 
 		/*
+		 * BOB supplies the WCD938x mic-bias rail (vendor
+		 * regulator-pm8350c-bob, abl-final-fdt.dts phandle 0x30c).
+		 */
+		pm8350c_bob: bob {
+			regulator-name = "pm8350c_bob";
+			regulator-min-microvolt = <3000000>;
+			regulator-max-microvolt = <3980000>;
+		};
+
+		/*
 		 * The panel's iovdd. Range copied from the vendor's own
 		 * regulator-pm8350c-l2 (abl-final-fdt.dts:6179-6187,
 		 * phandle 0x301), which qcom,dsi-display-primary names as
@@ -897,6 +938,22 @@
 				    <&cs35l41_br 0>, <&cs35l41_bl 0>;
 		};
 	};
+
+	mic-capture-dai-link {
+		link-name = "WCD Capture";
+
+		cpu {
+			sound-dai = <&q6apmbedai TX_CODEC_DMA_TX_3>;
+		};
+
+		platform {
+			sound-dai = <&q6apm>;
+		};
+
+		codec {
+			sound-dai = <&wcd938x 1>, <&swr2 0>, <&txmacro 0>;
+		};
+	};
 };
 
 &wsamacro {
@@ -905,6 +962,49 @@
 
 &wsa2macro {
 	status = "disabled";
+};
+
+/*
+ * Mic chain: vamacro is the fsgen clock provider every other macro takes,
+ * rxmacro supplies the WCD938x master clock, txmacro captures.  liuqin has
+ * no VA-macro DMICs (vendor dmic pinctrls are all disabled), hence no
+ * vdd-micb-supply / dmic pinctrl here.
+ */
+&vamacro {
+	status = "okay";
+};
+
+&rxmacro {
+	status = "okay";
+};
+
+&txmacro {
+	status = "okay";
+};
+
+&swr1 {
+	status = "okay";
+
+	wcd_rx: wcd9380-rx@0,4 {
+		compatible = "sdw20217010d00";
+		reg = <0 4>;
+		qcom,rx-port-mapping = <1 2 3 4 5>;
+	};
+};
+
+&swr2 {
+	status = "okay";
+
+	wcd_tx: wcd9380-tx@0,3 {
+		compatible = "sdw20217010d00";
+		reg = <0 3>;
+		/*
+		 * Vendor qcom,tx_swr_ch_map decoded: WCD TX slave ports 0 and 1
+		 * land on SWR master port 1, slave port 2 on master port 2,
+		 * slave port 3 on master port 3 (docs/features/audio-mic.zh-CN.md).
+		 */
+		qcom,tx-port-mapping = <1 1 2 3>;
+	};
 };
 
 /*
