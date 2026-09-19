@@ -906,6 +906,19 @@
 	compatible = "qcom,sm8450-sndcard";
 	model = "Xiaomi-Pad-6-Pro";
 
+	/*
+	 * Onboard-mic capture routing.  Mainline wcd938x pins ADC1 to its TX
+	 * slave port1/channel0 (wcd938x_sdw_tx_ch_info) and qcom,tx-port-mapping
+	 * <1 1 2 3> lands that on SoundWire master port 1 channel 0, which the
+	 * TX macro exposes as "TX SWR_INPUT0" (SMIC mux value SWR_MIC0) -- the
+	 * same wiring as sm8450-hdk.  The vendor's SWR_MIC4 only works with its
+	 * "ADC1 ChMap" override, which mainline does not have.  MIC BIAS1 feeds
+	 * AMIC1 (vendor amic1 path).  See docs/features/audio-mic.zh-CN.md.
+	 */
+	audio-routing =
+		"AMIC1", "MIC BIAS1",
+		"TX SWR_INPUT0", "ADC1_OUTPUT";
+
 	pinctrl-names = "default", "sleep";
 	pinctrl-0 = <&tert_tdm_clk_active>, <&tert_tdm_ws_active>,
 		    <&tert_tdm_din_active>, <&tert_tdm_dout_active>;
