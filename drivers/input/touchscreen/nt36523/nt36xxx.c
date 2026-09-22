@@ -726,20 +726,21 @@ static int32_t nvt_parse_dt(struct device *dev)
 	NVT_LOG("novatek,wgp-stylus=%d\n", ts->wgp_stylus);
 
 	/*
-	 * The pen half of the report is sampled on a finer grid than the panel,
-	 * and the vendor trees name two different factors for it in the two
-	 * boards that carry this controller: yudi sets novatek,wgp-stylus,
-	 * which this driver has always treated as ten firmware units per pixel,
-	 * and liuqin sets novatek,stylus-resol-double, which is two. Neither
-	 * changes the finger scale. With no property the pen reports panel
-	 * pixels like the touch half does.
+	 * The pen half of the report is sampled on the same fine grid as the
+	 * finger half: ten firmware units per panel pixel.  Measured on liuqin
+	 * with the stock firmware, pen coordinates span 17978 x 27934 for the
+	 * 1800 x 2880 panel, i.e. the same 1/10-pixel extent the fingers use,
+	 * so the default pen scale matches the finger scale.  A board whose pen
+	 * uses a coarser or finer grid can override with novatek,wgp-stylus
+	 * (ten units per pixel) or novatek,stylus-resol-double (two).  Neither
+	 * changes the finger scale.
 	 */
 	if (ts->wgp_stylus)
 		ts->pen_coord_scale = 10;
 	else if (of_property_read_bool(np, "novatek,stylus-resol-double"))
 		ts->pen_coord_scale = 2;
 	else
-		ts->pen_coord_scale = 1;
+		ts->pen_coord_scale = NVT_COORD_SCALE;
 	NVT_LOG("pen_coord_scale=%d\n", ts->pen_coord_scale);
 
 	ret = of_property_read_u32(np, "novatek,swrst-n8-addr", &SWRST_N8_ADDR);
@@ -799,7 +800,7 @@ static int32_t nvt_parse_dt(struct device *dev)
 	ts->reset_gpio = NVTTOUCH_RST_PIN;
 #endif
 	ts->irq_gpio = NVTTOUCH_INT_PIN;
-	ts->pen_coord_scale = 1;
+	ts->pen_coord_scale = NVT_COORD_SCALE;
 	return 0;
 }
 #endif
