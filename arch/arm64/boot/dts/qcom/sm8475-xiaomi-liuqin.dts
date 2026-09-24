@@ -271,6 +271,14 @@
 						remote-endpoint = <&usb_1_qmpphy_out>;
 					};
 				};
+
+				port@2 {
+					reg = <2>;
+
+					pmic_glink_sbu: endpoint {
+						remote-endpoint = <&fsa4480_sbu_mux>;
+					};
+				};
 			};
 		};
 	};
@@ -684,6 +692,26 @@
 &i2c5 {
 	clock-frequency = <100000>;
 	status = "okay";
+
+	/*
+	 * USB-C mux (FSA4480) that routes the SBU/AUX lanes between USB data
+	 * and DisplayPort. In DP Alt Mode pmic_glink_altmode flips this to DP
+	 * so an HDMI/DP dock gets a live AUX link. Sits next to the USB2
+	 * repeater on the same bus (vendor: fsa4480@42 on i2c@994000).
+	 */
+	typec-mux@42 {
+		compatible = "fcs,fsa4480";
+		reg = <0x42>;
+
+		mode-switch;
+		orientation-switch;
+
+		port {
+			fsa4480_sbu_mux: endpoint {
+				remote-endpoint = <&pmic_glink_sbu>;
+			};
+		};
+	};
 
 	nxp_eusb2_repeater: eusb2-repeater@4f {
 		compatible = "nxp,eusb2-repeater";
@@ -1167,6 +1195,21 @@
 	vdds-supply = <&pm8350_l5>;
 
 	status = "okay";
+};
+
+/*
+ * DisplayPort out over USB-C (DP Alt Mode). mdss_dp0 is the DPU's DP
+ * controller and drives the same shared QMP USB3+DP PHY (usb_1_qmpphy) as
+ * the USB3 port. The FSA4480 mux on i2c5 routes the SBU/AUX lanes to DP and
+ * pmic_glink_altmode takes the port out of USB mode, which is what lights an
+ * HDMI/DP dock up.
+ */
+&mdss_dp0 {
+	status = "okay";
+};
+
+&mdss_dp0_out {
+	data-lanes = <0 1>;
 };
 
 /*
