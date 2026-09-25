@@ -275,11 +275,11 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 		if (alt_port->conn_status != conn_status) {
 			alt_port->conn_status = conn_status;
 
-			dev_info(altmode->dev,
-				 "dp hpd bridge notify: svid=%#06x mode=%u orient=%d hpd_state=%u -> %s\n",
-				 alt_port->svid, alt_port->mode, (int)alt_port->orientation,
-				 alt_port->hpd_state,
-				 conn_status == connector_status_connected ? "connected" : "disconnected");
+			dev_dbg(altmode->dev,
+				"dp hpd bridge notify: svid=%#06x mode=%u orient=%d hpd_state=%u -> %s\n",
+				alt_port->svid, alt_port->mode, (int)alt_port->orientation,
+				alt_port->hpd_state,
+				conn_status == connector_status_connected ? "connected" : "disconnected");
 
 			drm_aux_hpd_bridge_notify(&alt_port->bridge->dev, conn_status);
 		}
@@ -301,31 +301,16 @@ static enum typec_orientation pmic_glink_altmode_orientation(unsigned int orient
 }
 
 /*
- * The liuqin PMIC charger firmware reports the cable orientation as the
- * typec_orientation enum value (1 = normal, 2 = reverse) instead of the 0/1
- * encoding the generic sc8280xp notification uses.  Decoding 1 as "reverse"
- * inverted the SBU and port-select state on every plug, so the DP AUX
- * channel was set up wrong for *both* physical cable orientations and the
- * first DPCD read always timed out.  Set liuqin_orientation_enum=0 to fall
- * back to the generic encoding.
+ * liuqin was once decoded as reporting the typec_orientation enum directly
+ * (1 = normal, 2 = reverse).  It does not: in every alt-mode notification
+ * observed on the tablet a connected dock reports 0 or 1 and only a
+ * disconnect reports 2, which is exactly the 0/1 encoding handled below plus
+ * 2 for "no alt mode".  The enum decode therefore turned a disconnect into a
+ * real orientation change, and qmp_combo_typec_switch_set() responds to one
+ * of those by tearing the combo PHY's COM block down and power-cycling USB3
+ * underneath the running xHCI -- which timed out ("phy initialization
+ * timed-out") and reset the tablet on every unplug.
  */
-static bool liuqin_orientation_enum = true;
-module_param(liuqin_orientation_enum, bool, 0644);
-MODULE_PARM_DESC(liuqin_orientation_enum,
-		 "liuqin PMIC firmware reports orientation as typec_orientation enum values");
-
-static enum typec_orientation
-pmic_glink_altmode_orientation_liuqin(unsigned int orientation)
-{
-	switch (orientation) {
-	case TYPEC_ORIENTATION_NORMAL:
-		return TYPEC_ORIENTATION_NORMAL;
-	case TYPEC_ORIENTATION_REVERSE:
-		return TYPEC_ORIENTATION_REVERSE;
-	default:
-		return TYPEC_ORIENTATION_NONE;
-	}
-}
 
 #define SC8180X_PORT_MASK		0x000000ff
 #define SC8180X_ORIENTATION_MASK	0x0000ff00
@@ -413,19 +398,17 @@ static void pmic_glink_altmode_sc8280xp_notify(struct pmic_glink_altmode *altmod
 	}
 
 	alt_port = &altmode->ports[port];
-	alt_port->orientation = liuqin_orientation_enum ?
-		pmic_glink_altmode_orientation_liuqin(orientation) :
-		pmic_glink_altmode_orientation(orientation);
+	alt_port->orientation = pmic_glink_altmode_orientation(orientation);
 	alt_port->svid = svid;
 	alt_port->mode = mode;
 	alt_port->hpd_state = hpd_state;
 	alt_port->hpd_irq = hpd_irq;
-	dev_info(altmode->dev,
-		 "sc8280xp notify: svid=%#06x port=%u orient=%u(%s) dpam=0x%02x mode=%u hpd_state=%u hpd_irq=%u\n",
-		 svid, port, orientation,
-		 alt_port->orientation == TYPEC_ORIENTATION_NORMAL ? "normal" :
-		 alt_port->orientation == TYPEC_ORIENTATION_REVERSE ? "reverse" : "none",
-		 notify->payload[8], mode, hpd_state, hpd_irq);
+	dev_dbg(altmode->dev,
+		"sc8280xp notify: svid=%#06x port=%u orient=%u(%s) dpam=0x%02x mode=%u hpd_state=%u hpd_irq=%u\n",
+		svid, port, orientation,
+		alt_port->orientation == TYPEC_ORIENTATION_NORMAL ? "normal" :
+		alt_port->orientation == TYPEC_ORIENTATION_REVERSE ? "reverse" : "none",
+		notify->payload[8], mode, hpd_state, hpd_irq);
 	schedule_work(&alt_port->work);
 }
 
