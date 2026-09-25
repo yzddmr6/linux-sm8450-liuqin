@@ -3364,7 +3364,7 @@ static int qmp_combo_dp_init(struct phy *phy)
 
 	cfg->dp_aux_init(qmp);
 
-	dev_info(qmp->dev,
+	dev_dbg(qmp->dev,
 		 "dp_init: orient=%d pd_ctl=%#x mode=%#x bias=%#x aux=%#x/%#x/%#x aux_st=%#x com_ts=%#x com_ms=%#x com_ro=%#x com_pd=%#x\n",
 		 qmp->orientation,
 		 readl(qmp->dp_dp_phy + QSERDES_DP_PHY_PD_CTL),
@@ -3424,7 +3424,7 @@ static int qmp_combo_dp_power_on(struct phy *phy)
 
 	mutex_unlock(&qmp->phy_mutex);
 
-	dev_info(qmp->dev,
+	dev_dbg(qmp->dev,
 		 "dp_power_on: serdes_ret=%d cfg_ret=%d com_mode=%#x pll_bias=%#x c_ready=%#x cmn=%#x pd_ctl=%#x cfg=%#x mode=%#x status=%#x\n",
 		 serdes_ret, cfg_ret,
 		 readl(qmp->com + QPHY_V3_DP_COM_PHY_MODE_CTRL),
@@ -4051,7 +4051,7 @@ static int qmp_combo_typec_switch_set(struct typec_switch_dev *sw,
 	if (orientation == qmp->orientation || orientation == TYPEC_ORIENTATION_NONE)
 		return 0;
 
-	dev_info(qmp->dev, "typec orientation: %d -> %d\n",
+	dev_dbg(qmp->dev, "typec orientation: %d -> %d\n",
 		 qmp->orientation, orientation);
 
 	mutex_lock(&qmp->phy_mutex);

@@ -1701,8 +1701,8 @@ int msm_dp_ctrl_core_clk_enable(struct msm_dp_ctrl *msm_dp_ctrl)
 	}
 
 	for (unsigned int i = 0; i < ctrl->num_core_clks; i++)
-		DRM_INFO("core clk[%u] %s rate=%lu\n", i, ctrl->core_clks[i].id,
-			 clk_get_rate(ctrl->core_clks[i].clk));
+		drm_dbg_dp(ctrl->drm_dev, "core clk[%u] %s rate=%lu\n", i,
+			   ctrl->core_clks[i].id, clk_get_rate(ctrl->core_clks[i].clk));
 
 	ctrl->core_clks_on = true;
 
@@ -1952,8 +1952,8 @@ void msm_dp_ctrl_phy_init(struct msm_dp_ctrl *msm_dp_ctrl)
 	phy_configure(phy, &ctrl->phy_opts);
 	ret = phy_power_on(phy);
 
-	DRM_INFO("phy_init init=%d power_on=%d power_on_ret=%d\n",
-		 phy->init_count, phy->power_count, ret);
+	drm_dbg_dp(ctrl->drm_dev, "phy_init init=%d power_on=%d power_on_ret=%d\n",
+		   phy->init_count, phy->power_count, ret);
 }
 
 void msm_dp_ctrl_phy_exit(struct msm_dp_ctrl *msm_dp_ctrl)

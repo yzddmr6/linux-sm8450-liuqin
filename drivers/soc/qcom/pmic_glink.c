@@ -49,11 +49,10 @@ static struct pmic_glink *__pmic_glink;
 static DEFINE_MUTEX(__pmic_glink_lock);
 
 /*
- * Diagnostic tracing of every USBC/PAN/UCSI glink message.  Enabled by default
- * for the external-DP bring-up; the traffic volume is low (PD/alt-mode events
- * plus UCSI command completions) so it is safe to leave in for a session.
+ * Diagnostic tracing of every USBC/PAN/UCSI glink message, kept available for
+ * USB-C bring-up but off by default.
  */
-static bool pmic_glink_trace = true;
+static bool pmic_glink_trace;
 module_param(pmic_glink_trace, bool, 0644);
 
 static void pmic_glink_dump(const char *dir, const void *data, size_t len)
