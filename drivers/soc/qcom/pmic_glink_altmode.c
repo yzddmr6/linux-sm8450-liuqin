@@ -495,6 +495,11 @@ static const struct file_operations pmic_glink_altmode_force_usb_fops = {
 	.write = pmic_glink_altmode_force_usb_write,
 };
 
+static void pmic_glink_altmode_debugfs_remove(void *dentry)
+{
+	debugfs_remove_recursive(dentry);
+}
+
 static void pmic_glink_altmode_pdr_notify(void *priv, int state)
 {
 	struct pmic_glink_altmode *altmode = priv;
@@ -641,7 +646,7 @@ static int pmic_glink_altmode_probe(struct auxiliary_device *adev,
 				    &pmic_glink_altmode_force_dp_fops);
 		debugfs_create_file("force_usb", 0200, altmode->debugfs, altmode,
 				    &pmic_glink_altmode_force_usb_fops);
-		devm_add_action_or_reset(dev, debugfs_remove_recursive, altmode->debugfs);
+		devm_add_action_or_reset(dev, pmic_glink_altmode_debugfs_remove, altmode->debugfs);
 	}
 
 	return 0;
