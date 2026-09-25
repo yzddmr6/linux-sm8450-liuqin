@@ -398,8 +398,10 @@ static int msm_dp_display_process_hpd_high(struct msm_dp_display_private *dp)
 	u8 dpcd[DP_RECEIVER_CAP_SIZE];
 
 	rc = drm_dp_read_dpcd_caps(dp->aux, dpcd);
-	if (rc)
+	if (rc) {
+		DRM_ERROR("failed to read DPCD caps, rc=%d\n", rc);
 		goto end;
+	}
 
 	dp->link->lttpr_count = msm_dp_display_lttpr_init(dp, dpcd);
 
@@ -593,6 +595,8 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp, u32 data)
 	state =  dp->hpd_state;
 	drm_dbg_dp(dp->drm_dev, "Before, type=%d hpd_state=%d\n",
 			dp->msm_dp_display.connector_type, state);
+	dev_info(dp->drm_dev->dev, "hpd plug: type=%d hpd_state=%d\n",
+			dp->msm_dp_display.connector_type, state);
 
 	if (state == ST_DISPLAY_OFF) {
 		mutex_unlock(&dp->event_mutex);
@@ -619,6 +623,8 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp, u32 data)
 	}
 
 	ret = msm_dp_display_usbpd_configure_cb(&pdev->dev);
+	dev_info(dp->drm_dev->dev, "hpd plug: configure_cb ret=%d hpd_state=%d\n",
+		 ret, dp->hpd_state);
 	if (ret) {	/* link train failed */
 		dp->hpd_state = ST_DISCONNECTED;
 		pm_runtime_put_sync(&pdev->dev);

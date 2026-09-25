@@ -261,6 +261,12 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 		conn_status = (alt_port->mode == 0xff) ?
 			connector_status_disconnected : connector_status_connected;
 
+		dev_info(altmode->dev,
+			 "dp hpd bridge notify: svid=%#06x mode=%u orient=%d hpd_state=%u -> %s\n",
+			 alt_port->svid, alt_port->mode, (int)alt_port->orientation,
+			 alt_port->hpd_state,
+			 conn_status == connector_status_connected ? "connected" : "disconnected");
+
 		drm_aux_hpd_bridge_notify(&alt_port->bridge->dev, conn_status);
 	} else {
 		pmic_glink_altmode_enable_usb(altmode, alt_port);
