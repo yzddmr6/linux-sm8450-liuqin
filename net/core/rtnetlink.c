@@ -2159,10 +2159,29 @@ static int rtnl_fill_ifinfo(struct sk_buff *skb,
 		goto nla_put_failure_rcu;
 	rcu_read_unlock();
 
-	if (dev->dev.parent &&
-	    nla_put_string(skb, IFLA_PARENT_DEV_NAME,
-			   dev_name(dev->dev.parent)))
-		goto nla_put_failure;
+	if (dev->dev.parent) {
+		const struct device *parent = dev->dev.parent;
+		const char *parent_name = dev_name(parent);
+
+		if (!parent_name) {
+			/*
+			 * dev_name() returns NULL for a device that was
+			 * initialised but never named.  Handing that to
+			 * nla_put_string() is a NULL strlen() in the kernel
+			 * (seen here as an oops in gnome-shell while dumping
+			 * the interface list).  Omit the attribute and name the
+			 * device, so the unnamed parent can be tracked down.
+			 */
+			dev_warn_once(&dev->dev,
+				      "RTNL: netdev '%s' has an unnamed parent device (init_name=%s kobj.name=%s type=%s parent=%s); omitting IFLA_PARENT_DEV_NAME\n",
+				      dev->name, parent->init_name,
+				      parent->kobj.name,
+				      parent->type ? parent->type->name : "(none)",
+				      parent->parent ? dev_name(parent->parent) : "(none)");
+		} else if (nla_put_string(skb, IFLA_PARENT_DEV_NAME, parent_name)) {
+			goto nla_put_failure;
+		}
+	}
 
 	if (dev->dev.parent && dev->dev.parent->bus &&
 	    nla_put_string(skb, IFLA_PARENT_DEV_BUS_NAME,
