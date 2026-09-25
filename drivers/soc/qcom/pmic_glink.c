@@ -60,7 +60,7 @@ static void pmic_glink_dump(const char *dir, const void *data, size_t len)
 {
 	const struct pmic_glink_hdr *hdr = data;
 	const u8 *p = data;
-	char buf[96];
+	char buf[256];
 	int off, i;
 
 	if (!pmic_glink_trace)
@@ -71,7 +71,7 @@ static void pmic_glink_dump(const char *dir, const void *data, size_t len)
 	off = scnprintf(buf, sizeof(buf), "pmic_glink %s owner=%u type=%u opcode=0x%x len=%zu",
 			dir, le32_to_cpu(hdr->owner), le32_to_cpu(hdr->type),
 			le32_to_cpu(hdr->opcode), len);
-	for (i = 0; i < (int)len && i < 24 && off < (int)sizeof(buf) - 4; i++)
+	for (i = 0; i < (int)len && i < 32 && off < (int)sizeof(buf) - 4; i++)
 		off += scnprintf(buf + off, sizeof(buf) - off, " %02x", p[i]);
 	pr_info("%s\n", buf);
 }

@@ -6,7 +6,6 @@
 #include <linux/auxiliary_bus.h>
 #include <linux/bitfield.h>
 #include <linux/cleanup.h>
-#include <linux/debugfs.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
@@ -30,6 +29,8 @@
 
 #define ALTMODE_PAN_EN		0x10
 #define ALTMODE_PAN_ACK		0x11
+
+#define PMIC_GLINK_LIUQIN_DP_SID	0xff01
 
 struct usbc_write_req {
 	struct pmic_glink_hdr   hdr;
@@ -102,8 +103,6 @@ struct pmic_glink_altmode {
 	struct pmic_glink_client *client;
 
 	struct work_struct enable_work;
-
-	struct dentry *debugfs;
 
 	struct pmic_glink_altmode_port ports[PMIC_GLINK_MAX_PORTS];
 };
@@ -217,6 +216,18 @@ static void pmic_glink_altmode_safe(struct pmic_glink_altmode *altmode,
 		dev_err(altmode->dev, "failed to setup retimer to USB: %d\n", ret);
 }
 
+/*
+ * The liuqin PMIC charger firmware identifies the DisplayPort alt mode with a
+ * vendor svid (0xff01) in the notification opcode instead of the USB-IF
+ * DisplayPort SVID (0x040e); the vendor msm_drm registers its DP altmode
+ * client with id 0xff01.  Accept both so the worker routes DP notifications
+ * to the DP path rather than misclassifying them as USB.
+ */
+static bool pmic_glink_altmode_is_dp(u16 svid)
+{
+	return svid == USB_TYPEC_DP_SID || svid == PMIC_GLINK_LIUQIN_DP_SID;
+}
+
 static void pmic_glink_altmode_worker(struct work_struct *work)
 {
 	struct pmic_glink_altmode_port *alt_port = work_to_altmode_port(work);
@@ -225,7 +236,7 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 
 	typec_switch_set(alt_port->typec_switch, alt_port->orientation);
 
-	if (alt_port->svid == USB_TYPEC_DP_SID) {
+	if (pmic_glink_altmode_is_dp(alt_port->svid)) {
 		if (alt_port->mode == 0xff) {
 			pmic_glink_altmode_safe(altmode, alt_port);
 		} else {
@@ -359,6 +370,9 @@ static void pmic_glink_altmode_sc8280xp_notify(struct pmic_glink_altmode *altmod
 	alt_port->mode = mode;
 	alt_port->hpd_state = hpd_state;
 	alt_port->hpd_irq = hpd_irq;
+	dev_info(altmode->dev,
+		 "sc8280xp notify: svid=%#06x port=%u orient=%u dpam=0x%02x mode=%u hpd_state=%u hpd_irq=%u\n",
+		 svid, port, orientation, notify->payload[8], mode, hpd_state, hpd_irq);
 	schedule_work(&alt_port->work);
 }
 
@@ -408,96 +422,6 @@ static void pmic_glink_altmode_enable_worker(struct work_struct *work)
 	ret = pmic_glink_altmode_request(altmode, ALTMODE_PAN_EN, 0);
 	if (ret)
 		dev_err(altmode->dev, "failed to request altmode notifications: %d\n", ret);
-}
-
-/*
- * Debug-only: synthesize a PMIC USBC notification so the full AP-side path
- * (typec mux/switch, DP hpd bridge, DP controller power-up, AUX link training)
- * can be exercised without waiting for the PMIC firmware to enter DP mode.
- * The trailing PAN_ACK the worker emits is harmless -- the PMIC simply acks it.
- */
-static int pmic_glink_altmode_inject(struct pmic_glink_altmode *altmode, int port, bool dp)
-{
-	struct pmic_glink_altmode_port *alt_port;
-
-	if (port < 0 || port >= ARRAY_SIZE(altmode->ports) || !altmode->ports[port].altmode)
-		return -EINVAL;
-
-	alt_port = &altmode->ports[port];
-	alt_port->orientation = TYPEC_ORIENTATION_NORMAL;
-	if (dp) {
-		alt_port->svid = USB_TYPEC_DP_SID;
-		alt_port->mode = 0;		/* DPAM_HPD_A - 1 -> DP_A */
-		alt_port->hpd_state = 1;
-		alt_port->hpd_irq = 0;
-	} else {
-		alt_port->svid = 0;
-	}
-
-	schedule_work(&alt_port->work);
-	return 0;
-}
-
-static int pmic_glink_altmode_parse_port(const char __user *ubuf, size_t count, int *port)
-{
-	char kbuf[8];
-
-	if (count == 0)
-		return 0;
-	if (count >= sizeof(kbuf))
-		count = sizeof(kbuf) - 1;
-	if (copy_from_user(kbuf, ubuf, count))
-		return -EFAULT;
-	kbuf[count] = 0;
-
-	if (kstrtoint(kbuf, 10, port))
-		*port = 0;
-
-	return 0;
-}
-
-static ssize_t pmic_glink_altmode_force_write(struct file *file, const char __user *ubuf,
-					      size_t count, loff_t *ppos, bool dp)
-{
-	struct pmic_glink_altmode *altmode = file->private_data;
-	int port = 0, ret;
-
-	ret = pmic_glink_altmode_parse_port(ubuf, count, &port);
-	if (ret)
-		return ret;
-
-	ret = pmic_glink_altmode_inject(altmode, port, dp);
-	if (ret)
-		return ret;
-
-	return count;
-}
-
-static ssize_t pmic_glink_altmode_force_dp_write(struct file *file, const char __user *ubuf,
-						 size_t count, loff_t *ppos)
-{
-	return pmic_glink_altmode_force_write(file, ubuf, count, ppos, true);
-}
-
-static ssize_t pmic_glink_altmode_force_usb_write(struct file *file, const char __user *ubuf,
-						  size_t count, loff_t *ppos)
-{
-	return pmic_glink_altmode_force_write(file, ubuf, count, ppos, false);
-}
-
-static const struct file_operations pmic_glink_altmode_force_dp_fops = {
-	.owner = THIS_MODULE,
-	.write = pmic_glink_altmode_force_dp_write,
-};
-
-static const struct file_operations pmic_glink_altmode_force_usb_fops = {
-	.owner = THIS_MODULE,
-	.write = pmic_glink_altmode_force_usb_write,
-};
-
-static void pmic_glink_altmode_debugfs_remove(void *dentry)
-{
-	debugfs_remove_recursive(dentry);
 }
 
 static void pmic_glink_altmode_pdr_notify(void *priv, int state)
@@ -639,15 +563,6 @@ static int pmic_glink_altmode_probe(struct auxiliary_device *adev,
 		return PTR_ERR(altmode->client);
 
 	pmic_glink_client_register(altmode->client);
-
-	altmode->debugfs = debugfs_create_dir(dev_name(dev), NULL);
-	if (!IS_ERR(altmode->debugfs)) {
-		debugfs_create_file("force_dp", 0200, altmode->debugfs, altmode,
-				    &pmic_glink_altmode_force_dp_fops);
-		debugfs_create_file("force_usb", 0200, altmode->debugfs, altmode,
-				    &pmic_glink_altmode_force_usb_fops);
-		devm_add_action_or_reset(dev, pmic_glink_altmode_debugfs_remove, altmode->debugfs);
-	}
 
 	return 0;
 }
