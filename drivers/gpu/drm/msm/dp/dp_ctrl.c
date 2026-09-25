@@ -1695,8 +1695,14 @@ int msm_dp_ctrl_core_clk_enable(struct msm_dp_ctrl *msm_dp_ctrl)
 	}
 
 	ret = clk_bulk_prepare_enable(ctrl->num_core_clks, ctrl->core_clks);
-	if (ret)
+	if (ret) {
+		DRM_ERROR("core clk enable failed: %d\n", ret);
 		return ret;
+	}
+
+	for (unsigned int i = 0; i < ctrl->num_core_clks; i++)
+		DRM_INFO("core clk[%u] %s rate=%lu\n", i, ctrl->core_clks[i].id,
+			 clk_get_rate(ctrl->core_clks[i].clk));
 
 	ctrl->core_clks_on = true;
 
@@ -1785,6 +1791,18 @@ static int msm_dp_ctrl_enable_mainlink_clocks(struct msm_dp_ctrl_private *ctrl)
 	ctrl->phy_opts.dp.lanes = ctrl->link->link_params.num_lanes;
 	ctrl->phy_opts.dp.link_rate = ctrl->link->link_params.rate / 100;
 	ctrl->phy_opts.dp.ssc = drm_dp_max_downspread(dpcd);
+
+	/*
+	 * msm_dp_ctrl_phy_init() already powered the PHY on so that AUX would
+	 * come up, but with provisional RBR options.  phy_configure() only
+	 * latches the new options -- the rate-dependent PLL/serdes bring-up
+	 * lives in power_on(), which is a no-op while power_count is non-zero,
+	 * so the PHY would otherwise stay tuned for RBR while the link runs at
+	 * the sink's rate and training fails.  Power-cycle it now that the DPCD
+	 * read has told us the real rate.
+	 */
+	if (phy->power_count)
+		phy_power_off(phy);
 
 	phy_configure(phy, &ctrl->phy_opts);
 	phy_power_on(phy);
@@ -1908,15 +1926,34 @@ void msm_dp_ctrl_phy_init(struct msm_dp_ctrl *msm_dp_ctrl)
 {
 	struct msm_dp_ctrl_private *ctrl;
 	struct phy *phy;
+	int ret;
 
 	ctrl = container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
 	phy = ctrl->phy;
 
 	msm_dp_ctrl_phy_reset(ctrl);
-	phy_init(phy);
 
-	drm_dbg_dp(ctrl->drm_dev, "phy=%p init=%d power_on=%d\n",
-			phy, phy->init_count, phy->power_count);
+	ret = phy_init(phy);
+
+	/*
+	 * Bring the DP PHY up before the first AUX transaction, as the vendor's
+	 * dp_ctrl_host_init() does.  mainline defers phy_configure()/phy_power_on()
+	 * to msm_dp_ctrl_enable_mainlink_clocks(), i.e. to after
+	 * process_hpd_high() has already tried to read the sink's DPCD over AUX,
+	 * so that first read goes out with the DP block held down and times out.
+	 * Conservative RBR/2-lane options here; the real link parameters are
+	 * applied later by msm_dp_ctrl_enable_mainlink_clocks().
+	 */
+	if (!ctrl->phy_opts.dp.lanes)
+		ctrl->phy_opts.dp.lanes = 2;
+	if (!ctrl->phy_opts.dp.link_rate)
+		ctrl->phy_opts.dp.link_rate = 1620;
+
+	phy_configure(phy, &ctrl->phy_opts);
+	ret = phy_power_on(phy);
+
+	DRM_INFO("phy_init init=%d power_on=%d power_on_ret=%d\n",
+		 phy->init_count, phy->power_count, ret);
 }
 
 void msm_dp_ctrl_phy_exit(struct msm_dp_ctrl *msm_dp_ctrl)

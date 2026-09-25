@@ -141,6 +141,18 @@ static int fsa4480_set(struct fsa4480 *fsa)
 		usleep_range(15, 1000);
 	}
 
+	{
+		unsigned int r04, r05, r07;
+
+		regmap_read(fsa->regmap, FSA4480_SWITCH_ENABLE, &r04);
+		regmap_read(fsa->regmap, FSA4480_SWITCH_SELECT, &r05);
+		regmap_read(fsa->regmap, FSA4480_SWITCH_STATUS1, &r07);
+		dev_info(&fsa->client->dev,
+			 "set: mode=%#lx svid=%#06x orient=%d swap=%d rev=%d sel=%#x en=%#x rd=%#x/%#x/%#x\n",
+			 fsa->mode, fsa->svid, fsa->orientation,
+			 fsa->swap_sbu_lanes, reverse, sel, enable, r04, r05, r07);
+	}
+
 	fsa->cur_enable = enable;
 
 	return 0;
