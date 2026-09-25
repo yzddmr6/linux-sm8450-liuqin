@@ -200,8 +200,15 @@ static ssize_t msm_dp_aux_cmd_fifo_tx(struct msm_dp_aux_private *aux,
 
 	time_left = wait_for_completion_timeout(&aux->comp,
 						msecs_to_jiffies(250));
-	if (!time_left)
+	if (!time_left) {
+		DRM_INFO("aux: no isr in 250ms (ctrl=%#x status=%#x trans=%#x tmo=%#x hpd=%#x)\n",
+			 msm_dp_read_aux(aux, REG_DP_AUX_CTRL),
+			 msm_dp_read_aux(aux, REG_DP_AUX_STATUS),
+			 msm_dp_read_aux(aux, REG_DP_AUX_TRANS_CTRL),
+			 msm_dp_read_aux(aux, REG_DP_TIMEOUT_COUNT),
+			 msm_dp_read_aux(aux, REG_DP_DP_HPD_INT_STATUS));
 		return -ETIMEDOUT;
+	}
 
 	return ret;
 }
@@ -492,6 +499,18 @@ irqreturn_t msm_dp_aux_isr(struct drm_dp_aux *msm_dp_aux, u32 isr)
 	} else {
 		DRM_WARN("Unexpected interrupt: %#010x\n", isr);
 		return IRQ_NONE;
+	}
+
+	if (aux->aux_error_num == DP_AUX_ERR_NONE) {
+		DRM_INFO("aux: xfer ok (%#010x)\n", isr);
+	} else {
+		static bool logged_aux_err;
+
+		if (!logged_aux_err) {
+			logged_aux_err = true;
+			DRM_INFO("aux: isr err isr=%#010x err_num=%d native=%d\n",
+				 isr, aux->aux_error_num, aux->native);
+		}
 	}
 
 	complete(&aux->comp);

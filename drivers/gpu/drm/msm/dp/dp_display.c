@@ -396,8 +396,24 @@ static int msm_dp_display_process_hpd_high(struct msm_dp_display_private *dp)
 	const struct drm_display_info *info = &connector->display_info;
 	int rc = 0;
 	u8 dpcd[DP_RECEIVER_CAP_SIZE];
+	int attempt;
 
-	rc = drm_dp_read_dpcd_caps(dp->aux, dpcd);
+	/*
+	 * The first AUX transaction of a plug occasionally gets no reply on
+	 * liuqin: the controller drives it, the ISR reports DP_INTR_TIMEOUT, and
+	 * the DPCD read fails with -ETIMEDOUT.  It has been observed to succeed
+	 * on the same code, so retry instead of abandoning the whole plug on the
+	 * first timeout -- this is bounded and gives each plug several samples.
+	 */
+	for (attempt = 0; attempt < 5; attempt++) {
+		rc = drm_dp_read_dpcd_caps(dp->aux, dpcd);
+		if (!rc)
+			break;
+
+		DRM_INFO("DPCD read attempt %d/5 failed: %d\n", attempt + 1, rc);
+		msleep(100);
+	}
+
 	if (rc) {
 		DRM_ERROR("failed to read DPCD caps, rc=%d\n", rc);
 		goto end;
