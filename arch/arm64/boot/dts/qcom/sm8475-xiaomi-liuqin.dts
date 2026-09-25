@@ -230,10 +230,20 @@
 	/*
 	 * The charger PD runs on ADSP and publishes PMIC_RTR_ADSP_APPS, exactly
 	 * as the vendor FDT describes.  The connector is now wired through as
-	 * well: pmic-glink UCSI reports the data role and CC orientation, the
-	 * DWC3 follows it as an OTG dual-role port, and the QMP combo PHY takes
-	 * the orientation for its lane swap (vendor routes the CC orientation
-	 * line to TLMM gpio91).
+	 * well: pmic-glink UCSI reports the data role, the DWC3 follows it as an
+	 * OTG dual-role port, and the QMP combo PHY takes the cable orientation
+	 * for its lane swap.
+	 *
+	 * The cable orientation reaches the kernel only through the DP alt-mode
+	 * notification (pmic_glink_altmode), decoded as typec_orientation enum
+	 * values, and that is the source the vendor DP driver uses too -- its
+	 * dp_aux_configure_aux_switch() maps 1 -> SBU normal, 2 -> SBU reverse.
+	 * There is deliberately no "orientation-gpios" here: TLMM gpio91 is the
+	 * QMP combo PHY port-select input (see usb3_phy_portselect_default), not
+	 * a CC-orientation line.  Declaring it as an orientation GPIO made
+	 * ucsi_glink drive the USB-C port orientation from a pin that reads a
+	 * constant, which pinned the FSA4480 SBU switch to one polarity and
+	 * broke DP AUX for both cable orientations.
 	 */
 	pmic-glink {
 		compatible = "qcom,sm8475-pmic-glink",
@@ -241,8 +251,6 @@
 			     "qcom,pmic-glink";
 		#address-cells = <1>;
 		#size-cells = <0>;
-
-		orientation-gpios = <&tlmm 91 GPIO_ACTIVE_HIGH>;
 
 		connector@0 {
 			compatible = "usb-c-connector";
@@ -1705,6 +1713,19 @@
 &usb_1_dwc3 {
 	dr_mode = "otg";
 	usb-role-switch;
+	/*
+	 * The role comes from UCSI on the ADSP.  ucsi_partner_change() reports
+	 * USB_ROLE_NONE whenever it does not recognise PARTNER_TYPE or sees
+	 * PARTNER_FLAG_USB clear, and dwc3 maps every role other than host/device
+	 * onto role-switch-default-mode -- which, left unset, is "peripheral".
+	 * Attaching a dock that the ADSP describes that way therefore switched
+	 * the port to device mode, tore the xHCI down and killed *all* USB,
+	 * plain USB2 included.  Default to host instead: the tablet is the host
+	 * for docks and drives.  The rescue gadget still gets peripheral mode,
+	 * because initramfs/init writes that role to the switch itself when no
+	 * UDC is registered.
+	 */
+	role-switch-default-mode = "host";
 	phys = <&usb_1_hsphy>, <&usb_1_qmpphy QMP_USB43DP_USB3_PHY>;
 	phy-names = "usb2-phy", "usb3-phy";
 };
