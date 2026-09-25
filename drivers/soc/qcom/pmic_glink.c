@@ -48,6 +48,34 @@ struct pmic_glink {
 static struct pmic_glink *__pmic_glink;
 static DEFINE_MUTEX(__pmic_glink_lock);
 
+/*
+ * Diagnostic tracing of every USBC/PAN/UCSI glink message.  Enabled by default
+ * for the external-DP bring-up; the traffic volume is low (PD/alt-mode events
+ * plus UCSI command completions) so it is safe to leave in for a session.
+ */
+static bool pmic_glink_trace = true;
+module_param(pmic_glink_trace, bool, 0644);
+
+static void pmic_glink_dump(const char *dir, const void *data, size_t len)
+{
+	const struct pmic_glink_hdr *hdr = data;
+	const u8 *p = data;
+	char buf[96];
+	int off, i;
+
+	if (!pmic_glink_trace)
+		return;
+	if (len < sizeof(*hdr))
+		return;
+
+	off = scnprintf(buf, sizeof(buf), "pmic_glink %s owner=%u type=%u opcode=0x%x len=%zu",
+			dir, le32_to_cpu(hdr->owner), le32_to_cpu(hdr->type),
+			le32_to_cpu(hdr->opcode), len);
+	for (i = 0; i < (int)len && i < 24 && off < (int)sizeof(buf) - 4; i++)
+		off += scnprintf(buf + off, sizeof(buf) - off, " %02x", p[i]);
+	pr_info("%s\n", buf);
+}
+
 struct pmic_glink_client {
 	struct list_head node;
 
@@ -123,6 +151,8 @@ int pmic_glink_send(struct pmic_glink_client *client, void *data, size_t len)
 		return -ECONNRESET;
 	}
 
+	pmic_glink_dump("TX", data, len);
+
 	start = jiffies;
 	for (;;) {
 		ret = rpmsg_send(pg->ept, data, len);
@@ -156,6 +186,7 @@ static int pmic_glink_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
 	}
 
 	hdr = data;
+	pmic_glink_dump("RX", data, len);
 
 	spin_lock_irqsave(&pg->client_lock, flags);
 	list_for_each_entry(client, &pg->clients, node) {
