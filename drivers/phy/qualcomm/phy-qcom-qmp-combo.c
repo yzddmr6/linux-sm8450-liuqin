@@ -2499,6 +2499,65 @@ static const struct qmp_phy_cfg sm8350_usb3dpphy_cfg = {
 	.has_pwrdn_delay	= true,
 };
 
+/*
+ * Per-rate DP PLL settings for the SM8475 (diwali) DP PHY.
+ *
+ * These are the v4 PLL divider/lock values written through the v6 register
+ * map.  The vendor's dp_config_vco_rate_4nm() builds a per-rate database and
+ * then writes it to 0x3c/0x88/0x90/0x94/0x98/0x80/0x84/0x120, which are the
+ * QSERDES_V6_COM_* rate registers; the bytes it writes are exactly the ones in
+ * qmp_v4_dp_serdes_tbl_{rbr,hbr,hbr2,hbr3}.  (Only DIV_FRAC_START1 is new --
+ * mainline programs that once in the base table instead.)
+ *
+ * This matters: DEC_START/DIV_FRAC/LOCK_CMP set the VCO's target frequency and
+ * lock thresholds.  Using the stock v6 rate tables leaves the VCO aiming at the
+ * wrong frequency, so the PLL never locks, COM_C_READY_STATUS never asserts, and
+ * the PHY -- AUX transceiver included -- never comes up.
+ */
+static const struct qmp_phy_init_tbl sm8475_dp_serdes_tbl_rbr[] = {
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_HSCLK_SEL_1, 0x05),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_DEC_START_MODE0, 0x69),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_DIV_FRAC_START1_MODE0, 0x00),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_DIV_FRAC_START2_MODE0, 0x80),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_DIV_FRAC_START3_MODE0, 0x07),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_LOCK_CMP1_MODE0, 0x6f),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_LOCK_CMP2_MODE0, 0x08),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_LOCK_CMP_EN, 0x04),
+};
+
+static const struct qmp_phy_init_tbl sm8475_dp_serdes_tbl_hbr[] = {
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_HSCLK_SEL_1, 0x03),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_DEC_START_MODE0, 0x69),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_DIV_FRAC_START1_MODE0, 0x00),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_DIV_FRAC_START2_MODE0, 0x80),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_DIV_FRAC_START3_MODE0, 0x07),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_LOCK_CMP1_MODE0, 0x0f),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_LOCK_CMP2_MODE0, 0x0e),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_LOCK_CMP_EN, 0x08),
+};
+
+static const struct qmp_phy_init_tbl sm8475_dp_serdes_tbl_hbr2[] = {
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_HSCLK_SEL_1, 0x01),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_DEC_START_MODE0, 0x8c),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_DIV_FRAC_START1_MODE0, 0x00),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_DIV_FRAC_START2_MODE0, 0x00),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_DIV_FRAC_START3_MODE0, 0x0a),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_LOCK_CMP1_MODE0, 0x1f),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_LOCK_CMP2_MODE0, 0x1c),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_LOCK_CMP_EN, 0x08),
+};
+
+static const struct qmp_phy_init_tbl sm8475_dp_serdes_tbl_hbr3[] = {
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_HSCLK_SEL_1, 0x00),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_DEC_START_MODE0, 0x69),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_DIV_FRAC_START1_MODE0, 0x00),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_DIV_FRAC_START2_MODE0, 0x80),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_DIV_FRAC_START3_MODE0, 0x07),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_LOCK_CMP1_MODE0, 0x2f),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_LOCK_CMP2_MODE0, 0x2a),
+	QMP_PHY_INIT_CFG(QSERDES_V6_COM_LOCK_CMP_EN, 0x08),
+};
+
 static const struct qmp_phy_cfg sm8475_usb3dpphy_cfg = {
 	.offsets		= &qmp_combo_offsets_v3,
 
@@ -2513,24 +2572,44 @@ static const struct qmp_phy_cfg sm8475_usb3dpphy_cfg = {
 	.pcs_usb_tbl		= sm8350_usb3_pcs_usb_tbl,
 	.pcs_usb_tbl_num	= ARRAY_SIZE(sm8350_usb3_pcs_usb_tbl),
 
-	.dp_serdes_tbl		= qmp_v4_dp_serdes_tbl,
-	.dp_serdes_tbl_num	= ARRAY_SIZE(qmp_v4_dp_serdes_tbl),
-	.dp_tx_tbl		= qmp_v5_dp_tx_tbl,
-	.dp_tx_tbl_num		= ARRAY_SIZE(qmp_v5_dp_tx_tbl),
+	/*
+	 * liuqin's DP PHY is the 4nm generation ("4nm-v1" in the vendor DTB,
+	 * qcom,phy-version = <0x420>), whose COM/PLL registers are laid out like
+	 * the v6 PHY's.  The sm8350-vintage v4 DP tables describe a different
+	 * PHY: their register offsets land on unrelated registers, so the DP PLL
+	 * is never programmed, COM_C_READY_STATUS never asserts (so
+	 * configure_dp_phy() times out) and the PHY -- including the AUX
+	 * transceiver living in the same block -- never comes up.  The vendor's
+	 * dp_config_vco_rate_4nm() sequence extracted from msm_drm.ko, and the
+	 * qcom,aux-cfgN-settings properties in the stock DTB, match
+	 * qmp_v6_dp_serdes_tbl / qmp_v6_dp_tx_tbl entry for entry.
+	 *
+	 * USB3 is unaffected: qmp_v6_usb3phy_regs_layout differs from the v45
+	 * one only in COM/DP/TX entries, and all six PCS offsets the USB3 path
+	 * uses are numerically identical.
+	 *
+	 * Known gap: the vendor writes COM_BG_TIMER = 0x0e where the shared v6
+	 * serdes table uses 0x0a.  If the DP PLL still fails to lock, that is
+	 * the next thing to try.
+	 */
+	.dp_serdes_tbl		= qmp_v6_dp_serdes_tbl,
+	.dp_serdes_tbl_num	= ARRAY_SIZE(qmp_v6_dp_serdes_tbl),
+	.dp_tx_tbl		= qmp_v6_dp_tx_tbl,
+	.dp_tx_tbl_num		= ARRAY_SIZE(qmp_v6_dp_tx_tbl),
 
-	.serdes_tbl_rbr		= qmp_v4_dp_serdes_tbl_rbr,
-	.serdes_tbl_rbr_num	= ARRAY_SIZE(qmp_v4_dp_serdes_tbl_rbr),
-	.serdes_tbl_hbr		= qmp_v4_dp_serdes_tbl_hbr,
-	.serdes_tbl_hbr_num	= ARRAY_SIZE(qmp_v4_dp_serdes_tbl_hbr),
-	.serdes_tbl_hbr2	= qmp_v4_dp_serdes_tbl_hbr2,
-	.serdes_tbl_hbr2_num	= ARRAY_SIZE(qmp_v4_dp_serdes_tbl_hbr2),
-	.serdes_tbl_hbr3	= qmp_v4_dp_serdes_tbl_hbr3,
-	.serdes_tbl_hbr3_num	= ARRAY_SIZE(qmp_v4_dp_serdes_tbl_hbr3),
+	.serdes_tbl_rbr		= sm8475_dp_serdes_tbl_rbr,
+	.serdes_tbl_rbr_num	= ARRAY_SIZE(sm8475_dp_serdes_tbl_rbr),
+	.serdes_tbl_hbr		= sm8475_dp_serdes_tbl_hbr,
+	.serdes_tbl_hbr_num	= ARRAY_SIZE(sm8475_dp_serdes_tbl_hbr),
+	.serdes_tbl_hbr2	= sm8475_dp_serdes_tbl_hbr2,
+	.serdes_tbl_hbr2_num	= ARRAY_SIZE(sm8475_dp_serdes_tbl_hbr2),
+	.serdes_tbl_hbr3	= sm8475_dp_serdes_tbl_hbr3,
+	.serdes_tbl_hbr3_num	= ARRAY_SIZE(sm8475_dp_serdes_tbl_hbr3),
 
-	.swing_hbr_rbr		= &qmp_dp_v4_voltage_swing_hbr_rbr,
-	.pre_emphasis_hbr_rbr	= &qmp_dp_v4_pre_emphasis_hbr_rbr,
-	.swing_hbr3_hbr2	= &qmp_dp_v3_voltage_swing_hbr3_hbr2,
-	.pre_emphasis_hbr3_hbr2 = &qmp_dp_v4_pre_emphasis_hbr3_hbr2,
+	.swing_hbr_rbr		= &qmp_dp_v5_voltage_swing_hbr_rbr,
+	.pre_emphasis_hbr_rbr	= &qmp_dp_v6_pre_emphasis_hbr_rbr,
+	.swing_hbr3_hbr2	= &qmp_dp_v5_voltage_swing_hbr3_hbr2,
+	.pre_emphasis_hbr3_hbr2 = &qmp_dp_v5_pre_emphasis_hbr3_hbr2,
 
 	.dp_aux_init		= qmp_v4_dp_aux_init,
 	.configure_dp_tx	= qmp_v4_configure_dp_tx,
@@ -2541,7 +2620,7 @@ static const struct qmp_phy_cfg sm8475_usb3dpphy_cfg = {
 	.num_resets		= ARRAY_SIZE(msm8996_usb3phy_reset_l),
 	.vreg_list		= qmp_phy_vreg_l,
 	.num_vregs		= ARRAY_SIZE(qmp_phy_vreg_l),
-	.regs			= qmp_v45_usb3phy_regs_layout,
+	.regs			= qmp_v6_usb3phy_regs_layout,
 
 	.has_pwrdn_delay	= true,
 };
@@ -3224,6 +3303,19 @@ static int qmp_combo_com_init(struct qmp_combo *qmp, bool force)
 			SW_DPPHY_RESET_MUX | SW_DPPHY_RESET |
 			SW_USB3PHY_RESET_MUX | SW_USB3PHY_RESET);
 
+	/*
+	 * Leave the DP PHY's reset under software control, de-asserted.  The
+	 * vendor's dp_catalog_ctrl_usb_reset() writes RESET_OVRD_CTRL = 0x0a --
+	 * both MUX bits set, neither reset asserted -- so both PHYs are
+	 * explicitly held out of reset by software.  Clearing the override
+	 * instead hands the DP and USB3 resets back to the hardware power state
+	 * machine; if that PSM keeps the DP block (and with it the AUX
+	 * transceiver) in reset, the AUX controller drives a request with
+	 * nothing on the wire and every DPCD read times out with -ETIMEDOUT.
+	 * Re-assert only the DP half so the working USB3 path is untouched.
+	 */
+	qphy_setbits(com, QPHY_V3_DP_COM_RESET_OVRD_CTRL, SW_DPPHY_RESET_MUX);
+
 	qphy_clrbits(com, QPHY_V3_DP_COM_SWI_CTRL, 0x03);
 	qphy_clrbits(com, QPHY_V3_DP_COM_SW_RESET, SW_RESET);
 
@@ -3272,6 +3364,21 @@ static int qmp_combo_dp_init(struct phy *phy)
 
 	cfg->dp_aux_init(qmp);
 
+	dev_info(qmp->dev,
+		 "dp_init: orient=%d pd_ctl=%#x mode=%#x bias=%#x aux=%#x/%#x/%#x aux_st=%#x com_ts=%#x com_ms=%#x com_ro=%#x com_pd=%#x\n",
+		 qmp->orientation,
+		 readl(qmp->dp_dp_phy + QSERDES_DP_PHY_PD_CTL),
+		 readl(qmp->dp_dp_phy + QSERDES_DP_PHY_MODE),
+		 readl(qmp->dp_serdes + cfg->regs[QPHY_COM_BIAS_EN_CLKBUFLR_EN]),
+		 readl(qmp->dp_dp_phy + QSERDES_DP_PHY_AUX_CFG0),
+		 readl(qmp->dp_dp_phy + QSERDES_DP_PHY_AUX_CFG1),
+		 readl(qmp->dp_dp_phy + QSERDES_DP_PHY_AUX_CFG2),
+		 readl(qmp->dp_dp_phy + QSERDES_V4_DP_PHY_AUX_INTERRUPT_STATUS),
+		 readl(qmp->com + QPHY_V3_DP_COM_TYPEC_CTRL),
+		 readl(qmp->com + QPHY_V3_DP_COM_PHY_MODE_CTRL),
+		 readl(qmp->com + QPHY_V3_DP_COM_RESET_OVRD_CTRL),
+		 readl(qmp->com + QPHY_V3_DP_COM_POWER_DOWN_CTRL));
+
 	qmp->dp_init_count++;
 
 out_unlock:
@@ -3300,10 +3407,11 @@ static int qmp_combo_dp_power_on(struct phy *phy)
 	const struct qmp_phy_cfg *cfg = qmp->cfg;
 	void __iomem *tx = qmp->dp_tx;
 	void __iomem *tx2 = qmp->dp_tx2;
+	int serdes_ret, cfg_ret;
 
 	mutex_lock(&qmp->phy_mutex);
 
-	qmp_combo_dp_serdes_init(qmp);
+	serdes_ret = qmp_combo_dp_serdes_init(qmp);
 
 	qmp_configure_lane(qmp->dev, tx, cfg->dp_tx_tbl, cfg->dp_tx_tbl_num, 1);
 	qmp_configure_lane(qmp->dev, tx2, cfg->dp_tx_tbl, cfg->dp_tx_tbl_num, 2);
@@ -3312,9 +3420,21 @@ static int qmp_combo_dp_power_on(struct phy *phy)
 	cfg->configure_dp_tx(qmp);
 
 	/* Configure link rate, swing, etc. */
-	cfg->configure_dp_phy(qmp);
+	cfg_ret = cfg->configure_dp_phy(qmp);
 
 	mutex_unlock(&qmp->phy_mutex);
+
+	dev_info(qmp->dev,
+		 "dp_power_on: serdes_ret=%d cfg_ret=%d com_mode=%#x pll_bias=%#x c_ready=%#x cmn=%#x pd_ctl=%#x cfg=%#x mode=%#x status=%#x\n",
+		 serdes_ret, cfg_ret,
+		 readl(qmp->com + QPHY_V3_DP_COM_PHY_MODE_CTRL),
+		 readl(qmp->dp_serdes + cfg->regs[QPHY_COM_BIAS_EN_CLKBUFLR_EN]),
+		 readl(qmp->dp_serdes + cfg->regs[QPHY_COM_C_READY_STATUS]),
+		 readl(qmp->dp_serdes + cfg->regs[QPHY_COM_CMN_STATUS]),
+		 readl(qmp->dp_dp_phy + QSERDES_DP_PHY_PD_CTL),
+		 readl(qmp->dp_dp_phy + QSERDES_DP_PHY_CFG),
+		 readl(qmp->dp_dp_phy + QSERDES_DP_PHY_MODE),
+		 readl(qmp->dp_dp_phy + cfg->regs[QPHY_DP_PHY_STATUS]));
 
 	return 0;
 }
