@@ -410,7 +410,8 @@ static int msm_dp_display_process_hpd_high(struct msm_dp_display_private *dp)
 		if (!rc)
 			break;
 
-		DRM_INFO("DPCD read attempt %d/5 failed: %d\n", attempt + 1, rc);
+		drm_dbg_dp(dp->drm_dev, "DPCD read attempt %d/5 failed: %d\n",
+			   attempt + 1, rc);
 		msleep(100);
 	}
 
@@ -611,7 +612,7 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp, u32 data)
 	state =  dp->hpd_state;
 	drm_dbg_dp(dp->drm_dev, "Before, type=%d hpd_state=%d\n",
 			dp->msm_dp_display.connector_type, state);
-	dev_info(dp->drm_dev->dev, "hpd plug: type=%d hpd_state=%d\n",
+	dev_dbg(dp->drm_dev->dev, "hpd plug: type=%d hpd_state=%d\n",
 			dp->msm_dp_display.connector_type, state);
 
 	if (state == ST_DISPLAY_OFF) {
@@ -639,7 +640,7 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp, u32 data)
 	}
 
 	ret = msm_dp_display_usbpd_configure_cb(&pdev->dev);
-	dev_info(dp->drm_dev->dev, "hpd plug: configure_cb ret=%d hpd_state=%d\n",
+	dev_dbg(dp->drm_dev->dev, "hpd plug: configure_cb ret=%d hpd_state=%d\n",
 		 ret, dp->hpd_state);
 	if (ret) {	/* link train failed */
 		dp->hpd_state = ST_DISCONNECTED;
