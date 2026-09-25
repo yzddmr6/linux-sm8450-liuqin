@@ -82,6 +82,7 @@ struct pmic_glink_altmode_port {
 	struct auxiliary_device *bridge;
 
 	enum typec_orientation orientation;
+	enum drm_connector_status conn_status;
 	u16 svid;
 	u8 dp_data;
 	u8 mode;
@@ -247,27 +248,41 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 		}
 
 		/*
-		 * Drive the DP connector from the alt-mode state, not the PMIC
-		 * HPD.  The PMIC only asserts HPD once the shared QMP USB3+DP PHY
-		 * is in DP mode and the AUX channel is live, which happens only
-		 * after the DP controller powers up -- and the controller is
-		 * runtime-suspended until it sees a connect.  Gating the
-		 * connector on hpd_state therefore deadlocks (no HPD -> no
-		 * power-up -> no HPD) and an attached dock never lights up.
-		 * Connect whenever the DP alt mode is enabled and let the DP
-		 * controller settle the real sink state through its own AUX
-		 * probing.
+		 * Report the connector as connected only once the sink asserts HPD
+		 * (hpd_state in the notification), i.e. once the dock's DP bridge is
+		 * actually up.  Driving it connected regardless makes the DP driver
+		 * probe a bridge that is not ready yet, and that first AUX
+		 * transaction gets no reply -- the DPCD read then fails with
+		 * -ETIMEDOUT and the display never comes up.  This is why DP worked
+		 * only on the plugs whose notification carried hpd_state=1.
+		 *
+		 * An earlier version dropped this gate because it deadlocked: the
+		 * bridge asserts HPD only after the source powers the DP PHY, and
+		 * mainline powers the PHY only after the DPCD read.
+		 * msm_dp_ctrl_phy_init() now brings the PHY up first (as the
+		 * vendor's dp_ctrl_host_init() does), which breaks that cycle.
+		 *
+		 * Notify *only* on a connect/disconnect transition.  The sink
+		 * re-sends its notification whenever HPD-IRQ toggles, and every
+		 * notify makes the DP driver run a full plug cycle, whose
+		 * msm_dp_display_host_init() resets the DPU/MDSS.  Doing that every
+		 * couple of seconds resets the display controller underneath the
+		 * live internal DSI panel and blanks the screen.
 		 */
-		conn_status = (alt_port->mode == 0xff) ?
+		conn_status = (alt_port->mode == 0xff || !alt_port->hpd_state) ?
 			connector_status_disconnected : connector_status_connected;
 
-		dev_info(altmode->dev,
-			 "dp hpd bridge notify: svid=%#06x mode=%u orient=%d hpd_state=%u -> %s\n",
-			 alt_port->svid, alt_port->mode, (int)alt_port->orientation,
-			 alt_port->hpd_state,
-			 conn_status == connector_status_connected ? "connected" : "disconnected");
+		if (alt_port->conn_status != conn_status) {
+			alt_port->conn_status = conn_status;
 
-		drm_aux_hpd_bridge_notify(&alt_port->bridge->dev, conn_status);
+			dev_info(altmode->dev,
+				 "dp hpd bridge notify: svid=%#06x mode=%u orient=%d hpd_state=%u -> %s\n",
+				 alt_port->svid, alt_port->mode, (int)alt_port->orientation,
+				 alt_port->hpd_state,
+				 conn_status == connector_status_connected ? "connected" : "disconnected");
+
+			drm_aux_hpd_bridge_notify(&alt_port->bridge->dev, conn_status);
+		}
 	} else {
 		pmic_glink_altmode_enable_usb(altmode, alt_port);
 	}
@@ -283,6 +298,33 @@ static enum typec_orientation pmic_glink_altmode_orientation(unsigned int orient
 		return TYPEC_ORIENTATION_REVERSE;
 	else
 		return TYPEC_ORIENTATION_NONE;
+}
+
+/*
+ * The liuqin PMIC charger firmware reports the cable orientation as the
+ * typec_orientation enum value (1 = normal, 2 = reverse) instead of the 0/1
+ * encoding the generic sc8280xp notification uses.  Decoding 1 as "reverse"
+ * inverted the SBU and port-select state on every plug, so the DP AUX
+ * channel was set up wrong for *both* physical cable orientations and the
+ * first DPCD read always timed out.  Set liuqin_orientation_enum=0 to fall
+ * back to the generic encoding.
+ */
+static bool liuqin_orientation_enum = true;
+module_param(liuqin_orientation_enum, bool, 0644);
+MODULE_PARM_DESC(liuqin_orientation_enum,
+		 "liuqin PMIC firmware reports orientation as typec_orientation enum values");
+
+static enum typec_orientation
+pmic_glink_altmode_orientation_liuqin(unsigned int orientation)
+{
+	switch (orientation) {
+	case TYPEC_ORIENTATION_NORMAL:
+		return TYPEC_ORIENTATION_NORMAL;
+	case TYPEC_ORIENTATION_REVERSE:
+		return TYPEC_ORIENTATION_REVERSE;
+	default:
+		return TYPEC_ORIENTATION_NONE;
+	}
 }
 
 #define SC8180X_PORT_MASK		0x000000ff
@@ -371,14 +413,19 @@ static void pmic_glink_altmode_sc8280xp_notify(struct pmic_glink_altmode *altmod
 	}
 
 	alt_port = &altmode->ports[port];
-	alt_port->orientation = pmic_glink_altmode_orientation(orientation);
+	alt_port->orientation = liuqin_orientation_enum ?
+		pmic_glink_altmode_orientation_liuqin(orientation) :
+		pmic_glink_altmode_orientation(orientation);
 	alt_port->svid = svid;
 	alt_port->mode = mode;
 	alt_port->hpd_state = hpd_state;
 	alt_port->hpd_irq = hpd_irq;
 	dev_info(altmode->dev,
-		 "sc8280xp notify: svid=%#06x port=%u orient=%u dpam=0x%02x mode=%u hpd_state=%u hpd_irq=%u\n",
-		 svid, port, orientation, notify->payload[8], mode, hpd_state, hpd_irq);
+		 "sc8280xp notify: svid=%#06x port=%u orient=%u(%s) dpam=0x%02x mode=%u hpd_state=%u hpd_irq=%u\n",
+		 svid, port, orientation,
+		 alt_port->orientation == TYPEC_ORIENTATION_NORMAL ? "normal" :
+		 alt_port->orientation == TYPEC_ORIENTATION_REVERSE ? "reverse" : "none",
+		 notify->payload[8], mode, hpd_state, hpd_irq);
 	schedule_work(&alt_port->work);
 }
 
