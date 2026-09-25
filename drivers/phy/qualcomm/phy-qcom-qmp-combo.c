@@ -3931,6 +3931,9 @@ static int qmp_combo_typec_switch_set(struct typec_switch_dev *sw,
 	if (orientation == qmp->orientation || orientation == TYPEC_ORIENTATION_NONE)
 		return 0;
 
+	dev_info(qmp->dev, "typec orientation: %d -> %d\n",
+		 qmp->orientation, orientation);
+
 	mutex_lock(&qmp->phy_mutex);
 	qmp->orientation = orientation;
 
