@@ -243,8 +243,6 @@
 		#size-cells = <0>;
 
 		orientation-gpios = <&tlmm 91 GPIO_ACTIVE_HIGH>;
-		pinctrl-0 = <&usb3_orient_default>;
-		pinctrl-names = "default";
 
 		connector@0 {
 			compatible = "usb-c-connector";
@@ -1376,12 +1374,19 @@
 	gpio-reserved-ranges = <28 4>, <36 4>;
 	status = "okay";
 
-	/* Type-C CC orientation line into the QMP lane-swap decision. */
-	usb3_orient_default: usb3-orient-state {
+	/*
+	 * The QMP USB3/DP PHY port select line, the vendor's
+	 * usb3phy_portselect_default state (function usb_phy, pull-down,
+	 * drive 2). The QMP driver does the port select in software
+	 * (SW_PORTSELECT_MUX) from the typec orientation, but the vendor
+	 * applies this state to the PHY and pin 91's default function is
+	 * usb_phy, so match it.
+	 */
+	usb3_phy_portselect_default: usb3-phy-portselect-default {
 		pins = "gpio91";
-		function = "gpio";
-		bias-disable;
-		input-enable;
+		function = "usb_phy";
+		bias-pull-down;
+		drive-strength = <2>;
 	};
 
 	/*
@@ -1718,6 +1723,8 @@
 
 &usb_1_qmpphy {
 	compatible = "qcom,sm8475-qmp-usb3-dp-phy", "qcom,sm8450-qmp-usb3-dp-phy";
+	pinctrl-names = "default";
+	pinctrl-0 = <&usb3_phy_portselect_default>;
 	status = "okay";
 
 	vdda-phy-supply = <&pm8350c_l10>;
