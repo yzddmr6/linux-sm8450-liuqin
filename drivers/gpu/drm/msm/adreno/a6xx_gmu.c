@@ -1109,6 +1109,18 @@ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
 		status = GMU_COLD_BOOT;
 	}
 
+	/*
+	 * On the recovery path the CX power domain has been cycled, which can
+	 * clear the CM3's TCM even though the TCM-retention flag read above
+	 * still reports "retained". Taking the warm-boot path in that case
+	 * skips the firmware reload, so the CM3 boots from dead memory and
+	 * never acks the host OOB handshake, leaving the GPU stuck in a
+	 * hang -> recover -> hang loop. Force a cold boot (full firmware
+	 * reload and re-init) whenever we are recovering from a hang.
+	 */
+	if (a6xx_gpu->hung)
+		status = GMU_COLD_BOOT;
+
 	ret = a6xx_gmu_fw_start(gmu, status);
 	if (ret)
 		goto out;
