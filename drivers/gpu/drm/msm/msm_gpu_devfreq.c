@@ -93,6 +93,7 @@ static int msm_devfreq_get_dev_status(struct device *dev,
 	if (df->suspended) {
 		mutex_unlock(&df->lock);
 		status->busy_time = 0;
+		df->busy_percent = 0;
 		return 0;
 	}
 
@@ -108,6 +109,14 @@ static int msm_devfreq_get_dev_status(struct device *dev,
 		busy_time = ~0LU;
 
 	status->busy_time = busy_time;
+
+	if (status->total_time) {
+		u64 pct = div_u64((u64)status->busy_time * 100, status->total_time);
+
+		df->busy_percent = pct > 100 ? 100 : (unsigned int)pct;
+	} else {
+		df->busy_percent = 0;
+	}
 
 	return 0;
 }
@@ -237,6 +246,7 @@ void msm_devfreq_resume(struct msm_gpu *gpu)
 	df->busy_cycles = gpu->funcs->gpu_busy(gpu, &sample_rate);
 	df->time = ktime_get();
 	df->suspended = false;
+	df->busy_percent = 0;
 	mutex_unlock(&df->lock);
 
 	devfreq_resume_device(df->devfreq);
@@ -251,6 +261,7 @@ void msm_devfreq_suspend(struct msm_gpu *gpu)
 
 	mutex_lock(&df->lock);
 	df->suspended = true;
+	df->busy_percent = 0;
 	mutex_unlock(&df->lock);
 
 	devfreq_suspend_device(df->devfreq);

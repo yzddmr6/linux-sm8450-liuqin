@@ -145,6 +145,16 @@ struct msm_gpu_devfreq {
 	 */
 	u64 busy_cycles;
 
+	/**
+	 * busy_percent:
+	 *
+	 * Most recently computed GPU busy percentage (0-100), derived from the
+	 * busy/total time sampled by get_dev_status(). Updated by the devfreq
+	 * governor while the GPU is active and forced to zero when it is
+	 * suspended. Exposed to userspace as the gpu_busy_percent sysfs attr.
+	 */
+	unsigned int busy_percent;
+
 	/** time: Time of last sampling period. */
 	ktime_t time;
 
