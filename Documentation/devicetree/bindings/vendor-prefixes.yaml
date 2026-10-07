@@ -550,6 +550,8 @@ patternProperties:
     description: Firefly
   "^focaltech,.*":
     description: FocalTech Systems Co.,Ltd
+  "^fpc,.*":
+    description: Fingerprint Cards AB
   "^forlinx,.*":
     description: Baoding Forlinx Embedded Technology Co., Ltd.
   "^freebox,.*":

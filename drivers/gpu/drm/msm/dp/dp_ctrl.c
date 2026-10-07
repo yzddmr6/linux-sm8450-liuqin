@@ -137,6 +137,7 @@ struct msm_dp_ctrl_private {
 
 	u32 hw_revision;
 
+	bool phy_powered;
 	bool core_clks_on;
 	bool link_clks_on;
 	bool stream_clks_on;
@@ -1695,8 +1696,14 @@ int msm_dp_ctrl_core_clk_enable(struct msm_dp_ctrl *msm_dp_ctrl)
 	}
 
 	ret = clk_bulk_prepare_enable(ctrl->num_core_clks, ctrl->core_clks);
-	if (ret)
+	if (ret) {
+		DRM_ERROR("core clk enable failed: %d\n", ret);
 		return ret;
+	}
+
+	for (unsigned int i = 0; i < ctrl->num_core_clks; i++)
+		drm_dbg_dp(ctrl->drm_dev, "core clk[%u] %s rate=%lu\n", i,
+			   ctrl->core_clks[i].id, clk_get_rate(ctrl->core_clks[i].clk));
 
 	ctrl->core_clks_on = true;
 
@@ -1776,6 +1783,37 @@ static void msm_dp_ctrl_link_clk_disable(struct msm_dp_ctrl *msm_dp_ctrl)
 		   str_on_off(ctrl->core_clks_on));
 }
 
+/* Track this controller's power reference, including AUX-only bring-up. */
+static int msm_dp_ctrl_phy_power_off(struct msm_dp_ctrl_private *ctrl)
+{
+	int ret;
+
+	if (!ctrl->phy_powered)
+		return 0;
+
+	ret = phy_power_off(ctrl->phy);
+	if (ret)
+		DRM_ERROR("failed to power off DP PHY: %d\n", ret);
+	else
+		ctrl->phy_powered = false;
+
+	return ret;
+}
+
+static int msm_dp_ctrl_phy_power_on(struct msm_dp_ctrl_private *ctrl)
+{
+	int ret;
+
+	if (ctrl->phy_powered)
+		return 0;
+
+	ret = phy_power_on(ctrl->phy);
+	if (!ret)
+		ctrl->phy_powered = true;
+
+	return ret;
+}
+
 static int msm_dp_ctrl_enable_mainlink_clocks(struct msm_dp_ctrl_private *ctrl)
 {
 	int ret = 0;
@@ -1786,13 +1824,34 @@ static int msm_dp_ctrl_enable_mainlink_clocks(struct msm_dp_ctrl_private *ctrl)
 	ctrl->phy_opts.dp.link_rate = ctrl->link->link_params.rate / 100;
 	ctrl->phy_opts.dp.ssc = drm_dp_max_downspread(dpcd);
 
-	phy_configure(phy, &ctrl->phy_opts);
-	phy_power_on(phy);
+	/*
+	 * msm_dp_ctrl_phy_init() already powered the PHY on so that AUX would
+	 * come up, but with provisional RBR options.  phy_configure() only
+	 * latches the new options -- the rate-dependent PLL/serdes bring-up
+	 * lives in power_on(), which is a no-op while power_count is non-zero,
+	 * so the PHY would otherwise stay tuned for RBR while the link runs at
+	 * the sink's rate and training fails.  Power-cycle it now that the DPCD
+	 * read has told us the real rate.
+	 */
+	ret = msm_dp_ctrl_phy_power_off(ctrl);
+	if (ret)
+		return ret;
+
+	ret = phy_configure(phy, &ctrl->phy_opts);
+	if (ret)
+		return ret;
+
+	ret = msm_dp_ctrl_phy_power_on(ctrl);
+	if (ret)
+		return ret;
 
 	dev_pm_opp_set_rate(ctrl->dev, ctrl->link->link_params.rate * 1000);
 	ret = msm_dp_ctrl_link_clk_enable(&ctrl->msm_dp_ctrl);
-	if (ret)
+	if (ret) {
 		DRM_ERROR("Unable to start link clocks. ret=%d\n", ret);
+		dev_pm_opp_set_rate(ctrl->dev, 0);
+		msm_dp_ctrl_phy_power_off(ctrl);
+	}
 
 	drm_dbg_dp(ctrl->drm_dev, "link rate=%d\n", ctrl->link->link_params.rate);
 
@@ -1904,19 +1963,48 @@ static void msm_dp_ctrl_phy_reset(struct msm_dp_ctrl_private *ctrl)
 	msm_dp_write_ahb(ctrl, REG_DP_PHY_CTRL, 0x0);
 }
 
-void msm_dp_ctrl_phy_init(struct msm_dp_ctrl *msm_dp_ctrl)
+int msm_dp_ctrl_phy_init(struct msm_dp_ctrl *msm_dp_ctrl)
 {
 	struct msm_dp_ctrl_private *ctrl;
 	struct phy *phy;
+	int ret;
 
 	ctrl = container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
 	phy = ctrl->phy;
 
 	msm_dp_ctrl_phy_reset(ctrl);
-	phy_init(phy);
 
-	drm_dbg_dp(ctrl->drm_dev, "phy=%p init=%d power_on=%d\n",
-			phy, phy->init_count, phy->power_count);
+	ret = phy_init(phy);
+	if (ret)
+		return ret;
+
+	/*
+	 * Bring the DP PHY up before the first AUX transaction, as the vendor's
+	 * dp_ctrl_host_init() does.  mainline defers phy_configure()/phy_power_on()
+	 * to msm_dp_ctrl_enable_mainlink_clocks(), i.e. to after
+	 * process_hpd_high() has already tried to read the sink's DPCD over AUX,
+	 * so that first read goes out with the DP block held down and times out.
+	 * Conservative RBR/2-lane options here; the real link parameters are
+	 * applied later by msm_dp_ctrl_enable_mainlink_clocks().
+	 */
+	if (!ctrl->phy_opts.dp.lanes)
+		ctrl->phy_opts.dp.lanes = 2;
+	if (!ctrl->phy_opts.dp.link_rate)
+		ctrl->phy_opts.dp.link_rate = 1620;
+
+	ret = phy_configure(phy, &ctrl->phy_opts);
+	if (ret)
+		goto err_exit;
+
+	ret = msm_dp_ctrl_phy_power_on(ctrl);
+	if (ret)
+		goto err_exit;
+
+	return 0;
+
+err_exit:
+	phy_exit(phy);
+	return ret;
 }
 
 void msm_dp_ctrl_phy_exit(struct msm_dp_ctrl *msm_dp_ctrl)
@@ -1926,6 +2014,9 @@ void msm_dp_ctrl_phy_exit(struct msm_dp_ctrl *msm_dp_ctrl)
 
 	ctrl = container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
 	phy = ctrl->phy;
+
+	if (msm_dp_ctrl_phy_power_off(ctrl))
+		return;
 
 	msm_dp_ctrl_phy_reset(ctrl);
 	phy_exit(phy);
@@ -1950,7 +2041,7 @@ static int msm_dp_ctrl_reinitialize_mainlink(struct msm_dp_ctrl_private *ctrl)
 
 	msm_dp_ctrl_link_clk_disable(&ctrl->msm_dp_ctrl);
 
-	phy_power_off(phy);
+	msm_dp_ctrl_phy_power_off(ctrl);
 	/* hw recommended delay before re-enabling clocks */
 	msleep(20);
 
@@ -1976,7 +2067,7 @@ static int msm_dp_ctrl_deinitialize_mainlink(struct msm_dp_ctrl_private *ctrl)
 	dev_pm_opp_set_rate(ctrl->dev, 0);
 	msm_dp_ctrl_link_clk_disable(&ctrl->msm_dp_ctrl);
 
-	phy_power_off(phy);
+	msm_dp_ctrl_phy_power_off(ctrl);
 
 	/* aux channel down, reinit phy */
 	phy_exit(phy);
@@ -2557,7 +2648,7 @@ void msm_dp_ctrl_off_link_stream(struct msm_dp_ctrl *msm_dp_ctrl)
 	dev_pm_opp_set_rate(ctrl->dev, 0);
 	msm_dp_ctrl_link_clk_disable(&ctrl->msm_dp_ctrl);
 
-	phy_power_off(phy);
+	msm_dp_ctrl_phy_power_off(ctrl);
 
 	/* aux channel down, reinit phy */
 	phy_exit(phy);
@@ -2583,7 +2674,7 @@ void msm_dp_ctrl_off_link(struct msm_dp_ctrl *msm_dp_ctrl)
 	DRM_DEBUG_DP("Before, phy=%p init_count=%d power_on=%d\n",
 		phy, phy->init_count, phy->power_count);
 
-	phy_power_off(phy);
+	msm_dp_ctrl_phy_power_off(ctrl);
 
 	DRM_DEBUG_DP("After, phy=%p init_count=%d power_on=%d\n",
 		phy, phy->init_count, phy->power_count);
@@ -2611,7 +2702,7 @@ void msm_dp_ctrl_off(struct msm_dp_ctrl *msm_dp_ctrl)
 	dev_pm_opp_set_rate(ctrl->dev, 0);
 	msm_dp_ctrl_link_clk_disable(&ctrl->msm_dp_ctrl);
 
-	phy_power_off(phy);
+	msm_dp_ctrl_phy_power_off(ctrl);
 	drm_dbg_dp(ctrl->drm_dev, "phy=%p init=%d power_on=%d\n",
 			phy, phy->init_count, phy->power_count);
 }

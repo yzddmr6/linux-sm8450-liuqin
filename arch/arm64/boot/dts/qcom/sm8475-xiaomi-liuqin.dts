@@ -230,10 +230,20 @@
 	/*
 	 * The charger PD runs on ADSP and publishes PMIC_RTR_ADSP_APPS, exactly
 	 * as the vendor FDT describes.  The connector is now wired through as
-	 * well: pmic-glink UCSI reports the data role and CC orientation, the
-	 * DWC3 follows it as an OTG dual-role port, and the QMP combo PHY takes
-	 * the orientation for its lane swap (vendor routes the CC orientation
-	 * line to TLMM gpio91).
+	 * well: pmic-glink UCSI reports the data role, the DWC3 follows it as an
+	 * OTG dual-role port, and the QMP combo PHY takes the cable orientation
+	 * for its lane swap.
+	 *
+	 * The cable orientation reaches the kernel only through the DP alt-mode
+	 * notification (pmic_glink_altmode), decoded as typec_orientation enum
+	 * values, and that is the source the vendor DP driver uses too -- its
+	 * dp_aux_configure_aux_switch() maps 1 -> SBU normal, 2 -> SBU reverse.
+	 * There is deliberately no "orientation-gpios" here: TLMM gpio91 is the
+	 * QMP combo PHY port-select input (see usb3_phy_portselect_default), not
+	 * a CC-orientation line.  Declaring it as an orientation GPIO made
+	 * ucsi_glink drive the USB-C port orientation from a pin that reads a
+	 * constant, which pinned the FSA4480 SBU switch to one polarity and
+	 * broke DP AUX for both cable orientations.
 	 */
 	pmic-glink {
 		compatible = "qcom,sm8475-pmic-glink",
@@ -241,10 +251,6 @@
 			     "qcom,pmic-glink";
 		#address-cells = <1>;
 		#size-cells = <0>;
-
-		orientation-gpios = <&tlmm 91 GPIO_ACTIVE_HIGH>;
-		pinctrl-0 = <&usb3_orient_default>;
-		pinctrl-names = "default";
 
 		connector@0 {
 			compatible = "usb-c-connector";
@@ -269,6 +275,14 @@
 
 					pmic_glink_ss_in: endpoint {
 						remote-endpoint = <&usb_1_qmpphy_out>;
+					};
+				};
+
+				port@2 {
+					reg = <2>;
+
+					pmic_glink_sbu: endpoint {
+						remote-endpoint = <&fsa4480_sbu_mux>;
 					};
 				};
 			};
@@ -606,6 +620,14 @@
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 
+		/* FPC1264 VDD: retain the validated 2960000-3008000 uV HPM range. */
+		pm8350c_l9: ldo9 {
+			regulator-name = "pm8350c_l9";
+			regulator-min-microvolt = <2960000>;
+			regulator-max-microvolt = <3008000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
 		pm8350c_l10: ldo10 {
 			regulator-name = "pm8350c_l10";
 			regulator-min-microvolt = <1200000>;
@@ -713,6 +735,26 @@
 &i2c5 {
 	clock-frequency = <100000>;
 	status = "okay";
+
+	/*
+	 * USB-C mux (FSA4480) that routes the SBU/AUX lanes between USB data
+	 * and DisplayPort. In DP Alt Mode pmic_glink_altmode flips this to DP
+	 * so an HDMI/DP dock gets a live AUX link. Sits next to the USB2
+	 * repeater on the same bus (vendor: fsa4480@42 on i2c@994000).
+	 */
+	typec-mux@42 {
+		compatible = "fcs,fsa4480";
+		reg = <0x42>;
+
+		mode-switch;
+		orientation-switch;
+
+		port {
+			fsa4480_sbu_mux: endpoint {
+				remote-endpoint = <&pmic_glink_sbu>;
+			};
+		};
+	};
 
 	nxp_eusb2_repeater: eusb2-repeater@4f {
 		compatible = "nxp,eusb2-repeater";
@@ -1199,6 +1241,21 @@
 };
 
 /*
+ * DisplayPort out over USB-C (DP Alt Mode). mdss_dp0 is the DPU's DP
+ * controller and drives the same shared QMP USB3+DP PHY (usb_1_qmpphy) as
+ * the USB3 port. The FSA4480 mux on i2c5 routes the SBU/AUX lanes to DP and
+ * pmic_glink_altmode takes the port out of USB mode, which is what lights an
+ * HDMI/DP dock up.
+ */
+&mdss_dp0 {
+	status = "okay";
+};
+
+&mdss_dp0_out {
+	data-lanes = <0 1>;
+};
+
+/*
  * QCA6490 WLAN on PCIe RC0. The wifi child exists before enumeration so
  * pci-pwrctrl-pwrseq can claim the WCN6855 PMU's "wlan" target, raise gpio80
  * and the shared rails, and only then release the host bridge to scan the bus.
@@ -1358,9 +1415,48 @@
 	};
 };
 
-&tlmm {
-	gpio-reserved-ranges = <28 4>, <36 4>;
+/*
+ * Fingerprint sensor FPC1264 on chip select 0 of QUPv3 wrapper 1's
+ * third serial engine (spi10 / spi@a88000).
+ * Interrupt line is GPIO 40, reset line is GPIO 41, and power is fed from
+ * pm8350c_l9 (LDO9, strictly locked to 3.0 V, 2960000-3008000 uV).
+ */
+&spi10 {
 	status = "okay";
+	pinctrl-0 = <&qup_spi10_data_clk>, <&qup_spi10_cs>;
+	pinctrl-names = "default";
+
+	fingerprint@0 {
+		compatible = "fpc,fpc1020";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		interrupt-parent = <&tlmm>;
+		interrupts = <40 IRQ_TYPE_EDGE_RISING>;
+		reset-gpios = <&tlmm 41 GPIO_ACTIVE_LOW>;
+		vdd-supply = <&pm8350c_l9>;
+		pinctrl-0 = <&fingerprint_irq>, <&fingerprint_rst>;
+		pinctrl-names = "default";
+	};
+};
+
+&tlmm {
+	gpio-reserved-ranges = <28 4>;
+	status = "okay";
+
+	fingerprint_irq: fingerprint-irq-state {
+		pins = "gpio40";
+		function = "gpio";
+		bias-pull-down;
+		input-enable;
+	};
+
+	fingerprint_rst: fingerprint-rst-state {
+		pins = "gpio41";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-high;
+	};
 
 	cam_sensor_mclk2_active: cam-sensor-mclk2-active-state {
 		pins = "gpio102";
@@ -1376,12 +1472,19 @@
 		bias-disable;
 	};
 
-	/* Type-C CC orientation line into the QMP lane-swap decision. */
-	usb3_orient_default: usb3-orient-state {
+	/*
+	 * The QMP USB3/DP PHY port select line, the vendor's
+	 * usb3phy_portselect_default state (function usb_phy, pull-down,
+	 * drive 2). The QMP driver does the port select in software
+	 * (SW_PORTSELECT_MUX) from the typec orientation, but the vendor
+	 * applies this state to the PHY and pin 91's default function is
+	 * usb_phy, so match it.
+	 */
+	usb3_phy_portselect_default: usb3-phy-portselect-default {
 		pins = "gpio91";
-		function = "gpio";
-		bias-disable;
-		input-enable;
+		function = "usb_phy";
+		bias-pull-down;
+		drive-strength = <2>;
 	};
 
 	/*
@@ -1700,6 +1803,19 @@
 &usb_1_dwc3 {
 	dr_mode = "otg";
 	usb-role-switch;
+	/*
+	 * The role comes from UCSI on the ADSP.  ucsi_partner_change() reports
+	 * USB_ROLE_NONE whenever it does not recognise PARTNER_TYPE or sees
+	 * PARTNER_FLAG_USB clear, and dwc3 maps every role other than host/device
+	 * onto role-switch-default-mode -- which, left unset, is "peripheral".
+	 * Attaching a dock that the ADSP describes that way therefore switched
+	 * the port to device mode, tore the xHCI down and killed *all* USB,
+	 * plain USB2 included.  Default to host instead: the tablet is the host
+	 * for docks and drives.  The rescue gadget still gets peripheral mode,
+	 * because initramfs/init writes that role to the switch itself when no
+	 * UDC is registered.
+	 */
+	role-switch-default-mode = "host";
 	phys = <&usb_1_hsphy>, <&usb_1_qmpphy QMP_USB43DP_USB3_PHY>;
 	phy-names = "usb2-phy", "usb3-phy";
 };
@@ -1718,6 +1834,8 @@
 
 &usb_1_qmpphy {
 	compatible = "qcom,sm8475-qmp-usb3-dp-phy", "qcom,sm8450-qmp-usb3-dp-phy";
+	pinctrl-names = "default";
+	pinctrl-0 = <&usb3_phy_portselect_default>;
 	status = "okay";
 
 	vdda-phy-supply = <&pm8350c_l10>;

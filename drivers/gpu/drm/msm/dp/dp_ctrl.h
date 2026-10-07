@@ -33,7 +33,7 @@ struct msm_dp_ctrl *msm_dp_ctrl_get(struct device *dev,
 				    void __iomem *link_base);
 
 void msm_dp_ctrl_reset(struct msm_dp_ctrl *msm_dp_ctrl);
-void msm_dp_ctrl_phy_init(struct msm_dp_ctrl *msm_dp_ctrl);
+int msm_dp_ctrl_phy_init(struct msm_dp_ctrl *msm_dp_ctrl);
 void msm_dp_ctrl_phy_exit(struct msm_dp_ctrl *msm_dp_ctrl);
 void msm_dp_ctrl_irq_phy_exit(struct msm_dp_ctrl *msm_dp_ctrl);
 

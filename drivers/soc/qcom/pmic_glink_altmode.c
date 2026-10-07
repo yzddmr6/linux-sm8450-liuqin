@@ -30,6 +30,8 @@
 #define ALTMODE_PAN_EN		0x10
 #define ALTMODE_PAN_ACK		0x11
 
+#define PMIC_GLINK_LIUQIN_DP_SID	0xff01
+
 struct usbc_write_req {
 	struct pmic_glink_hdr   hdr;
 	__le32 cmd;
@@ -80,6 +82,7 @@ struct pmic_glink_altmode_port {
 	struct auxiliary_device *bridge;
 
 	enum typec_orientation orientation;
+	enum drm_connector_status conn_status;
 	u16 svid;
 	u8 dp_data;
 	u8 mode;
@@ -214,6 +217,18 @@ static void pmic_glink_altmode_safe(struct pmic_glink_altmode *altmode,
 		dev_err(altmode->dev, "failed to setup retimer to USB: %d\n", ret);
 }
 
+/*
+ * The liuqin PMIC charger firmware identifies the DisplayPort alt mode with a
+ * vendor svid (0xff01) in the notification opcode instead of the USB-IF
+ * DisplayPort SVID (0x040e); the vendor msm_drm registers its DP altmode
+ * client with id 0xff01.  Accept both so the worker routes DP notifications
+ * to the DP path rather than misclassifying them as USB.
+ */
+static bool pmic_glink_altmode_is_dp(u16 svid)
+{
+	return svid == USB_TYPEC_DP_SID || svid == PMIC_GLINK_LIUQIN_DP_SID;
+}
+
 static void pmic_glink_altmode_worker(struct work_struct *work)
 {
 	struct pmic_glink_altmode_port *alt_port = work_to_altmode_port(work);
@@ -222,7 +237,7 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 
 	typec_switch_set(alt_port->typec_switch, alt_port->orientation);
 
-	if (alt_port->svid == USB_TYPEC_DP_SID) {
+	if (pmic_glink_altmode_is_dp(alt_port->svid)) {
 		if (alt_port->mode == 0xff) {
 			pmic_glink_altmode_safe(altmode, alt_port);
 		} else {
@@ -232,12 +247,42 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 						     alt_port->hpd_irq);
 		}
 
-		if (alt_port->hpd_state)
-			conn_status = connector_status_connected;
-		else
-			conn_status = connector_status_disconnected;
+		/*
+		 * Report the connector as connected only once the sink asserts HPD
+		 * (hpd_state in the notification), i.e. once the dock's DP bridge is
+		 * actually up.  Driving it connected regardless makes the DP driver
+		 * probe a bridge that is not ready yet, and that first AUX
+		 * transaction gets no reply -- the DPCD read then fails with
+		 * -ETIMEDOUT and the display never comes up.  This is why DP worked
+		 * only on the plugs whose notification carried hpd_state=1.
+		 *
+		 * An earlier version dropped this gate because it deadlocked: the
+		 * bridge asserts HPD only after the source powers the DP PHY, and
+		 * mainline powers the PHY only after the DPCD read.
+		 * msm_dp_ctrl_phy_init() now brings the PHY up first (as the
+		 * vendor's dp_ctrl_host_init() does), which breaks that cycle.
+		 *
+		 * Notify *only* on a connect/disconnect transition.  The sink
+		 * re-sends its notification whenever HPD-IRQ toggles, and every
+		 * notify makes the DP driver run a full plug cycle, whose
+		 * msm_dp_display_host_init() resets the DPU/MDSS.  Doing that every
+		 * couple of seconds resets the display controller underneath the
+		 * live internal DSI panel and blanks the screen.
+		 */
+		conn_status = (alt_port->mode == 0xff || !alt_port->hpd_state) ?
+			connector_status_disconnected : connector_status_connected;
 
-		drm_aux_hpd_bridge_notify(&alt_port->bridge->dev, conn_status);
+		if (alt_port->conn_status != conn_status) {
+			alt_port->conn_status = conn_status;
+
+			dev_dbg(altmode->dev,
+				"dp hpd bridge notify: svid=%#06x mode=%u orient=%d hpd_state=%u -> %s\n",
+				alt_port->svid, alt_port->mode, (int)alt_port->orientation,
+				alt_port->hpd_state,
+				conn_status == connector_status_connected ? "connected" : "disconnected");
+
+			drm_aux_hpd_bridge_notify(&alt_port->bridge->dev, conn_status);
+		}
 	} else {
 		pmic_glink_altmode_enable_usb(altmode, alt_port);
 	}
@@ -254,6 +299,18 @@ static enum typec_orientation pmic_glink_altmode_orientation(unsigned int orient
 	else
 		return TYPEC_ORIENTATION_NONE;
 }
+
+/*
+ * liuqin was once decoded as reporting the typec_orientation enum directly
+ * (1 = normal, 2 = reverse).  It does not: in every alt-mode notification
+ * observed on the tablet a connected dock reports 0 or 1 and only a
+ * disconnect reports 2, which is exactly the 0/1 encoding handled below plus
+ * 2 for "no alt mode".  The enum decode therefore turned a disconnect into a
+ * real orientation change, and qmp_combo_typec_switch_set() responds to one
+ * of those by tearing the combo PHY's COM block down and power-cycling USB3
+ * underneath the running xHCI -- which timed out ("phy initialization
+ * timed-out") and reset the tablet on every unplug.
+ */
 
 #define SC8180X_PORT_MASK		0x000000ff
 #define SC8180X_ORIENTATION_MASK	0x0000ff00
@@ -346,6 +403,12 @@ static void pmic_glink_altmode_sc8280xp_notify(struct pmic_glink_altmode *altmod
 	alt_port->mode = mode;
 	alt_port->hpd_state = hpd_state;
 	alt_port->hpd_irq = hpd_irq;
+	dev_dbg(altmode->dev,
+		"sc8280xp notify: svid=%#06x port=%u orient=%u(%s) dpam=0x%02x mode=%u hpd_state=%u hpd_irq=%u\n",
+		svid, port, orientation,
+		alt_port->orientation == TYPEC_ORIENTATION_NORMAL ? "normal" :
+		alt_port->orientation == TYPEC_ORIENTATION_REVERSE ? "reverse" : "none",
+		notify->payload[8], mode, hpd_state, hpd_irq);
 	schedule_work(&alt_port->work);
 }
 

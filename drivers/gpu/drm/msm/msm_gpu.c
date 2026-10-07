@@ -958,6 +958,32 @@ msm_gpu_create_private_vm(struct msm_gpu *gpu, struct task_struct *task,
 	return vm;
 }
 
+/*
+ * Expose the current GPU busy percentage (as sampled by the devfreq governor)
+ * on the GPU platform device, so userspace tools can report utilization without
+ * polling the raw GMU counter themselves.
+ */
+static ssize_t gpu_busy_percent_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct msm_gpu *gpu = dev_to_gpu(dev);
+
+	if (!gpu)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%u\n", gpu->devfreq.busy_percent);
+}
+static DEVICE_ATTR_RO(gpu_busy_percent);
+
+static struct attribute *msm_gpu_attrs[] = {
+	&dev_attr_gpu_busy_percent.attr,
+	NULL,
+};
+
+static struct attribute_group msm_gpu_sysfs_group = {
+	.attrs = msm_gpu_attrs,
+};
+
 int msm_gpu_init(struct drm_device *drm, struct platform_device *pdev,
 		struct msm_gpu *gpu, const struct msm_gpu_funcs *funcs,
 		const char *name, struct msm_gpu_config *config)
@@ -1048,6 +1074,19 @@ int msm_gpu_init(struct drm_device *drm, struct platform_device *pdev,
 	platform_set_drvdata(pdev, &gpu->adreno_smmu);
 
 	msm_devfreq_init(gpu);
+
+	/*
+	 * Only platforms that report a busy counter are interesting to userspace
+	 * utilization tools, so expose the attribute conditionally.
+	 */
+	if (funcs->gpu_busy) {
+		int group_ret = devm_device_add_group(&pdev->dev,
+				&msm_gpu_sysfs_group);
+		if (group_ret)
+			DRM_DEV_ERROR(&pdev->dev,
+				"failed to expose gpu_busy_percent: %d\n",
+				group_ret);
+	}
 
 	gpu->vm = gpu->funcs->create_vm(gpu, pdev);
 	if (IS_ERR(gpu->vm)) {

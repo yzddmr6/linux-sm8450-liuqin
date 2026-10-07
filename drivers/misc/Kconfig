@@ -644,6 +644,18 @@ config MCHP_LAN966X_PCI
 	    - lan966x-miim (MDIO_MSCC_MIIM)
 	    - lan966x-switch (LAN966X_SWITCH)
 
+config SENSORS_FPC1020_SPI
+	tristate "Fingerprint Cards FPC1264 SPI control interface"
+	depends on SPI_MASTER
+	help
+	  Hardware control and raw SPI transport for the Fingerprint Cards
+	  FPC1264 sensor on the Xiaomi Pad 6 Pro. Provides reset, power control,
+	  finger IRQ notification and a /dev/fpc1020 compatibility interface.
+
+	  Biometric enrolment and matching are handled by the OEM trusted
+	  application through QSEECOM, not by this transport driver. Configure
+	  it as a module for the existing late-load userspace integration.
+
 source "drivers/misc/c2port/Kconfig"
 source "drivers/misc/eeprom/Kconfig"
 source "drivers/misc/cb710/Kconfig"
