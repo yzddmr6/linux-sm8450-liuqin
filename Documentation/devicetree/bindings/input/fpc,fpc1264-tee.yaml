@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/input/fpc,fpc1264-tee.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Fingerprint Cards FPC1264 GPIO control for an OEM trusted application
+
+maintainers:
+  - reisa <reisa8366@gmail.com>
+
+description: |
+  Normal-world power, active-low reset and IRQ control for an FPC1264 sensor
+  whose SPI bus is managed by a trusted application. This is a platform device,
+  not a child of a Linux SPI controller. The binding does not grant normal-world
+  ownership of the SPI bus. Supply voltage constraints belong to the board.
+
+properties:
+  compatible:
+    const: fpc,fpc1264-tee
+
+  reset-gpios:
+    maxItems: 1
+    description: Active-low sensor reset line.
+
+  interrupts:
+    maxItems: 1
+    description: Sensor event interrupt.
+
+  vdd-supply:
+    description: Sensor power supply.
+
+required:
+  - compatible
+  - reset-gpios
+  - interrupts
+  - vdd-supply
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    fingerprint {
+        compatible = "fpc,fpc1264-tee";
+        interrupt-parent = <&tlmm>;
+        interrupts = <40 IRQ_TYPE_EDGE_RISING>;
+        reset-gpios = <&tlmm 41 GPIO_ACTIVE_LOW>;
+        vdd-supply = <&fingerprint_vdd>;
+    };

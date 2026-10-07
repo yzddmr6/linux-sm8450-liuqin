@@ -644,6 +644,33 @@ config MCHP_LAN966X_PCI
 	    - lan966x-miim (MDIO_MSCC_MIIM)
 	    - lan966x-switch (LAN966X_SWITCH)
 
+config SENSORS_FPC1264_TEE
+	tristate "Fingerprint Cards FPC1264 control for OEM TEE clients"
+	depends on OF && GPIOLIB && REGULATOR
+	help
+	  Platform-device power, reset and IRQ control for an FPC1264 whose
+	  SPI bus is owned by its OEM trusted application. Opening /dev/fpc1020
+	  powers/resets the sensor and poll reports interrupts. The last close
+	  powers it off. This driver does not access SPI or read a hardware ID.
+
+	  Board wiring must establish normal-world ownership of the reset/IRQ
+	  GPIOs and supply separately from the secure-world SPI bus. The liuqin
+	  product device tree does not enable this optional control path yet.
+
+config SENSORS_FPC1020_SPI
+	tristate "Fingerprint Cards FPC1264 experimental SPI diagnostics"
+	depends on SPI_MASTER
+	help
+	  Opt-in hardware control and raw SPI transport for the Fingerprint
+	  Cards FPC1264 sensor. Provides reset, power control,
+	  finger IRQ notification and a /dev/fpc1020 compatibility interface.
+
+	  Probe powers and resets the sensor and reads its hardware ID. Enable
+	  this only where Linux owns the SPI bus, pins, power and reset lines;
+	  it must not run alongside a TrustZone application owning that hardware.
+	  The liuqin device tree leaves this driver unconnected. Biometric
+	  enrolment and matching remain in the OEM trusted application.
+
 source "drivers/misc/c2port/Kconfig"
 source "drivers/misc/eeprom/Kconfig"
 source "drivers/misc/cb710/Kconfig"

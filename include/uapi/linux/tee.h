@@ -57,6 +57,8 @@
 #define TEE_IMPL_ID_OPTEE	1
 #define TEE_IMPL_ID_AMDTEE	2
 #define TEE_IMPL_ID_TSTEE	3
+/* External QSEECOM prototype ABI; this is not an upstream-assigned ID. */
+#define TEE_IMPL_ID_QSEECOM	5
 
 /*
  * OP-TEE specific capabilities

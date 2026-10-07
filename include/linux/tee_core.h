@@ -66,6 +66,7 @@ struct tee_device {
  * struct tee_driver_ops - driver operations vtable
  * @get_version:	returns version of driver
  * @open:		called when the device file is opened
+ * @close_context:	called when the device file is closed, before final release
  * @release:		release this open file
  * @open_session:	open a new session
  * @close_session:	close a session
@@ -81,6 +82,7 @@ struct tee_driver_ops {
 	void (*get_version)(struct tee_device *teedev,
 			    struct tee_ioctl_version_data *vers);
 	int (*open)(struct tee_context *ctx);
+	void (*close_context)(struct tee_context *ctx);
 	void (*release)(struct tee_context *ctx);
 	int (*open_session)(struct tee_context *ctx,
 			    struct tee_ioctl_open_session_arg *arg,
