@@ -3407,11 +3407,13 @@ static int qmp_combo_dp_power_on(struct phy *phy)
 	const struct qmp_phy_cfg *cfg = qmp->cfg;
 	void __iomem *tx = qmp->dp_tx;
 	void __iomem *tx2 = qmp->dp_tx2;
-	int serdes_ret, cfg_ret;
+	int serdes_ret, cfg_ret = 0;
 
 	mutex_lock(&qmp->phy_mutex);
 
 	serdes_ret = qmp_combo_dp_serdes_init(qmp);
+	if (serdes_ret)
+		goto out_unlock;
 
 	qmp_configure_lane(qmp->dev, tx, cfg->dp_tx_tbl, cfg->dp_tx_tbl_num, 1);
 	qmp_configure_lane(qmp->dev, tx2, cfg->dp_tx_tbl, cfg->dp_tx_tbl_num, 2);
@@ -3421,6 +3423,10 @@ static int qmp_combo_dp_power_on(struct phy *phy)
 
 	/* Configure link rate, swing, etc. */
 	cfg_ret = cfg->configure_dp_phy(qmp);
+
+out_unlock:
+	if (serdes_ret || cfg_ret)
+		writel(DP_PHY_PD_CTL_PSR_PWRDN, qmp->dp_dp_phy + QSERDES_DP_PHY_PD_CTL);
 
 	mutex_unlock(&qmp->phy_mutex);
 
@@ -3436,7 +3442,7 @@ static int qmp_combo_dp_power_on(struct phy *phy)
 		 readl(qmp->dp_dp_phy + QSERDES_DP_PHY_MODE),
 		 readl(qmp->dp_dp_phy + cfg->regs[QPHY_DP_PHY_STATUS]));
 
-	return 0;
+	return serdes_ret ?: cfg_ret;
 }
 
 static int qmp_combo_dp_power_off(struct phy *phy)
