@@ -458,16 +458,24 @@ end:
 	return rc;
 }
 
-static void msm_dp_display_host_phy_init(struct msm_dp_display_private *dp)
+static int msm_dp_display_host_phy_init(struct msm_dp_display_private *dp)
 {
+	int ret;
+
 	drm_dbg_dp(dp->drm_dev, "type=%d core_init=%d phy_init=%d\n",
 		dp->msm_dp_display.connector_type, dp->core_initialized,
 		dp->phy_initialized);
 
 	if (!dp->phy_initialized) {
-		msm_dp_ctrl_phy_init(dp->ctrl);
+		ret = msm_dp_ctrl_phy_init(dp->ctrl);
+		if (ret) {
+			DRM_ERROR("DP PHY initialization failed: %d\n", ret);
+			return ret;
+		}
 		dp->phy_initialized = true;
 	}
+
+	return 0;
 }
 
 static void msm_dp_display_host_phy_exit(struct msm_dp_display_private *dp)
@@ -511,10 +519,17 @@ static void msm_dp_display_host_deinit(struct msm_dp_display_private *dp)
 static int msm_dp_display_usbpd_configure_cb(struct device *dev)
 {
 	struct msm_dp_display_private *dp = dev_get_dp_display_private(dev);
+	int ret;
 
-	msm_dp_display_host_phy_init(dp);
+	ret = msm_dp_display_host_phy_init(dp);
+	if (ret)
+		return ret;
 
-	return msm_dp_display_process_hpd_high(dp);
+	ret = msm_dp_display_process_hpd_high(dp);
+	if (ret)
+		msm_dp_display_host_phy_exit(dp);
+
+	return ret;
 }
 
 static int msm_dp_display_notify_disconnect(struct device *dev)
@@ -1476,6 +1491,7 @@ static int msm_dp_pm_runtime_suspend(struct device *dev)
 static int msm_dp_pm_runtime_resume(struct device *dev)
 {
 	struct msm_dp_display_private *dp = dev_get_dp_display_private(dev);
+	int ret;
 
 	/*
 	 * for eDP, host cotroller, HPD block and PHY are enabled here
@@ -1488,7 +1504,12 @@ static int msm_dp_pm_runtime_resume(struct device *dev)
 	msm_dp_display_host_init(dp);
 	if (dp->msm_dp_display.is_edp) {
 		msm_dp_aux_hpd_enable(dp->aux);
-		msm_dp_display_host_phy_init(dp);
+		ret = msm_dp_display_host_phy_init(dp);
+		if (ret) {
+			msm_dp_aux_hpd_disable(dp->aux);
+			msm_dp_display_host_deinit(dp);
+			return ret;
+		}
 	}
 
 	enable_irq(dp->irq);
@@ -1645,7 +1666,12 @@ void msm_dp_bridge_atomic_enable(struct drm_bridge *drm_bridge,
 	hpd_state =  msm_dp_display->hpd_state;
 
 	if (hpd_state == ST_DISPLAY_OFF) {
-		msm_dp_display_host_phy_init(msm_dp_display);
+		rc = msm_dp_display_host_phy_init(msm_dp_display);
+		if (rc) {
+			pm_runtime_put_sync(&dp->pdev->dev);
+			mutex_unlock(&msm_dp_display->event_mutex);
+			return;
+		}
 		force_link_train = true;
 	}
 
