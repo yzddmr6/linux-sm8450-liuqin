@@ -396,10 +396,29 @@ static int msm_dp_display_process_hpd_high(struct msm_dp_display_private *dp)
 	const struct drm_display_info *info = &connector->display_info;
 	int rc = 0;
 	u8 dpcd[DP_RECEIVER_CAP_SIZE];
+	int attempt;
 
-	rc = drm_dp_read_dpcd_caps(dp->aux, dpcd);
-	if (rc)
+	/*
+	 * The first AUX transaction of a plug occasionally gets no reply on
+	 * liuqin: the controller drives it, the ISR reports DP_INTR_TIMEOUT, and
+	 * the DPCD read fails with -ETIMEDOUT.  It has been observed to succeed
+	 * on the same code, so retry instead of abandoning the whole plug on the
+	 * first timeout -- this is bounded and gives each plug several samples.
+	 */
+	for (attempt = 0; attempt < 5; attempt++) {
+		rc = drm_dp_read_dpcd_caps(dp->aux, dpcd);
+		if (!rc)
+			break;
+
+		drm_dbg_dp(dp->drm_dev, "DPCD read attempt %d/5 failed: %d\n",
+			   attempt + 1, rc);
+		msleep(100);
+	}
+
+	if (rc) {
+		DRM_ERROR("failed to read DPCD caps, rc=%d\n", rc);
 		goto end;
+	}
 
 	dp->link->lttpr_count = msm_dp_display_lttpr_init(dp, dpcd);
 
@@ -439,16 +458,24 @@ end:
 	return rc;
 }
 
-static void msm_dp_display_host_phy_init(struct msm_dp_display_private *dp)
+static int msm_dp_display_host_phy_init(struct msm_dp_display_private *dp)
 {
+	int ret;
+
 	drm_dbg_dp(dp->drm_dev, "type=%d core_init=%d phy_init=%d\n",
 		dp->msm_dp_display.connector_type, dp->core_initialized,
 		dp->phy_initialized);
 
 	if (!dp->phy_initialized) {
-		msm_dp_ctrl_phy_init(dp->ctrl);
+		ret = msm_dp_ctrl_phy_init(dp->ctrl);
+		if (ret) {
+			DRM_ERROR("DP PHY initialization failed: %d\n", ret);
+			return ret;
+		}
 		dp->phy_initialized = true;
 	}
+
+	return 0;
 }
 
 static void msm_dp_display_host_phy_exit(struct msm_dp_display_private *dp)
@@ -492,10 +519,17 @@ static void msm_dp_display_host_deinit(struct msm_dp_display_private *dp)
 static int msm_dp_display_usbpd_configure_cb(struct device *dev)
 {
 	struct msm_dp_display_private *dp = dev_get_dp_display_private(dev);
+	int ret;
 
-	msm_dp_display_host_phy_init(dp);
+	ret = msm_dp_display_host_phy_init(dp);
+	if (ret)
+		return ret;
 
-	return msm_dp_display_process_hpd_high(dp);
+	ret = msm_dp_display_process_hpd_high(dp);
+	if (ret)
+		msm_dp_display_host_phy_exit(dp);
+
+	return ret;
 }
 
 static int msm_dp_display_notify_disconnect(struct device *dev)
@@ -593,6 +627,8 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp, u32 data)
 	state =  dp->hpd_state;
 	drm_dbg_dp(dp->drm_dev, "Before, type=%d hpd_state=%d\n",
 			dp->msm_dp_display.connector_type, state);
+	dev_dbg(dp->drm_dev->dev, "hpd plug: type=%d hpd_state=%d\n",
+			dp->msm_dp_display.connector_type, state);
 
 	if (state == ST_DISPLAY_OFF) {
 		mutex_unlock(&dp->event_mutex);
@@ -619,6 +655,8 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp, u32 data)
 	}
 
 	ret = msm_dp_display_usbpd_configure_cb(&pdev->dev);
+	dev_dbg(dp->drm_dev->dev, "hpd plug: configure_cb ret=%d hpd_state=%d\n",
+		 ret, dp->hpd_state);
 	if (ret) {	/* link train failed */
 		dp->hpd_state = ST_DISCONNECTED;
 		pm_runtime_put_sync(&pdev->dev);
@@ -1453,6 +1491,7 @@ static int msm_dp_pm_runtime_suspend(struct device *dev)
 static int msm_dp_pm_runtime_resume(struct device *dev)
 {
 	struct msm_dp_display_private *dp = dev_get_dp_display_private(dev);
+	int ret;
 
 	/*
 	 * for eDP, host cotroller, HPD block and PHY are enabled here
@@ -1465,7 +1504,12 @@ static int msm_dp_pm_runtime_resume(struct device *dev)
 	msm_dp_display_host_init(dp);
 	if (dp->msm_dp_display.is_edp) {
 		msm_dp_aux_hpd_enable(dp->aux);
-		msm_dp_display_host_phy_init(dp);
+		ret = msm_dp_display_host_phy_init(dp);
+		if (ret) {
+			msm_dp_aux_hpd_disable(dp->aux);
+			msm_dp_display_host_deinit(dp);
+			return ret;
+		}
 	}
 
 	enable_irq(dp->irq);
@@ -1622,7 +1666,12 @@ void msm_dp_bridge_atomic_enable(struct drm_bridge *drm_bridge,
 	hpd_state =  msm_dp_display->hpd_state;
 
 	if (hpd_state == ST_DISPLAY_OFF) {
-		msm_dp_display_host_phy_init(msm_dp_display);
+		rc = msm_dp_display_host_phy_init(msm_dp_display);
+		if (rc) {
+			pm_runtime_put_sync(&dp->pdev->dev);
+			mutex_unlock(&msm_dp_display->event_mutex);
+			return;
+		}
 		force_link_train = true;
 	}
 
