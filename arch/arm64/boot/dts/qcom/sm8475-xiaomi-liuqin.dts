@@ -513,6 +513,27 @@
 		enable-active-high;
 		startup-delay-us = <100>;
 	};
+
+	/* IMX596 (front) module rails, from the vendor runtime DT. */
+	camera_front_vdig_ldo: regulator-camera-front-vdig {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_front_vdig_ldo";
+		regulator-min-microvolt = <1100000>;
+		regulator-max-microvolt = <1100000>;
+		regulator-enable-ramp-delay = <100>;
+		gpio = <&tlmm 74 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	camera_front_avdd_ldo: regulator-camera-front-avdd {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_front_avdd_ldo";
+		regulator-min-microvolt = <2900000>;
+		regulator-max-microvolt = <2900000>;
+		regulator-enable-ramp-delay = <100>;
+		gpio = <&tlmm 119 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
 };
 
 &apps_rsc {
@@ -1472,6 +1493,35 @@
 		bias-disable;
 	};
 
+	/* IMX596 (front): MCLK5 on gpio105, RESET5 on gpio127 (vendor runtime DT). */
+	cam_sensor_mclk5_active: cam-sensor-mclk5-active-state {
+		pins = "gpio105";
+		function = "cam_mclk";
+		drive-strength = <4>;
+		bias-disable;
+	};
+
+	cam_sensor_mclk5_suspend: cam-sensor-mclk5-suspend-state {
+		pins = "gpio105";
+		function = "cam_mclk";
+		drive-strength = <4>;
+		bias-pull-down;
+	};
+
+	cam_sensor_active_rst5: cam-sensor-active-rst5-state {
+		pins = "gpio127";
+		function = "gpio";
+		drive-strength = <4>;
+		bias-disable;
+	};
+
+	cam_sensor_suspend_rst5: cam-sensor-suspend-rst5-state {
+		pins = "gpio127";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+
 	/*
 	 * The QMP USB3/DP PHY port select line, the vendor's
 	 * usb3phy_portselect_default state (function usb_phy, pull-down,
@@ -1900,6 +1950,43 @@
 };
 
 /*
+ * IMX596 front camera on CCI0 / CSIPHY2.  The rails, lanes and the 678.4 MHz
+ * link frequency come from the vendor runtime graph and were checked on
+ * hardware.
+ */
+&cci0_i2c0 {
+	status = "okay";
+
+	camera@10 {
+		compatible = "sony,imx596";
+		orientation = <0>; /* front */
+		reg = <0x10>; /* vendor 8-bit write address 0x20 */
+		clocks = <&camcc CAM_CC_MCLK5_CLK>;
+		clock-names = "xvclk";
+		assigned-clocks = <&camcc CAM_CC_MCLK5_CLK>;
+		assigned-clock-rates = <19200000>;
+		reset-gpios = <&tlmm 127 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&cam_sensor_mclk5_active &cam_sensor_active_rst5>;
+		pinctrl-1 = <&cam_sensor_mclk5_suspend &cam_sensor_suspend_rst5>;
+		vddd-supply = <&camera_front_vdig_ldo>;
+		vdda-supply = <&camera_front_avdd_ldo>;
+		vddio-supply = <&pm8350c_l1>;
+		status = "okay";
+
+		port {
+			imx596_out: endpoint {
+				clock-lanes = <0>;
+				data-lanes = <1 2 3 4>;
+				/* 678.4 MHz, measured on the vendor stack (CAM_START_PHYDEV). */
+				link-frequencies = /bits/ 64 <678400000>;
+				remote-endpoint = <&camss_in2>;
+			};
+		};
+	};
+};
+
+/*
  * SM8475/Cape CAMSS path for the rear S5KJN1.
  * Runtime resources are derived from Qualcomm Cape/waipio camera DT.
  */
@@ -1981,6 +2068,16 @@
 		ports {
 			#address-cells = <1>;
 			#size-cells = <0>;
+
+			port@2 {
+				reg = <2>;
+
+				camss_in2: endpoint {
+					clock-lanes = <4>;
+					data-lanes = <0 1 2 3>;
+					remote-endpoint = <&imx596_out>;
+				};
+			};
 
 			port@3 {
 				reg = <3>;
