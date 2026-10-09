@@ -99,6 +99,7 @@ static const char * const dw9768_supply_names[] = {
 
 /* dw9768 device structure */
 struct dw9768 {
+	bool initialized;
 	struct regulator_bulk_data supplies[ARRAY_SIZE(dw9768_supply_names)];
 	struct v4l2_ctrl_handler ctrls;
 	struct v4l2_ctrl *focus;
@@ -313,7 +314,21 @@ static int dw9768_runtime_suspend(struct device *dev)
 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
 	struct dw9768 *dw9768 = sd_to_dw9768(sd);
 
-	dw9768_release(dw9768);
+	/*
+	 * liuqin: only run the power-down sequence if the chip actually came
+	 * up.  A resume whose init never reached the chip must not send more
+	 * I2C into an unpowered part (each write would just time out).
+	 *
+	 * This path is rare in a desktop session - libcamera (wireplumber)
+	 * opens this node at startup and holds it for the whole session, so
+	 * the suspend only runs on teardown - the lens is parked when the
+	 * sensor stops streaming (dw9768_s_stream()), which is also the last
+	 * moment the module is powered.
+	 */
+	if (dw9768->initialized)
+		dw9768_release(dw9768);
+	dw9768->initialized = false;
+
 	regulator_bulk_disable(ARRAY_SIZE(dw9768_supply_names),
 			       dw9768->supplies);
 
@@ -334,33 +349,49 @@ static int dw9768_runtime_resume(struct device *dev)
 	}
 
 	/*
-	 * The datasheet refers to t_OPR that needs to be waited before sending
-	 * I2C commands after power-up.
+	 * liuqin: do not touch the chip here.  The VCM sits on the camera
+	 * module, whose rails are switched by the sensor driver: at open
+	 * (acquire) time the module is usually still down, every CCI
+	 * transfer times out (-ETIMEDOUT) and the part is left in whatever
+	 * state the partial sequence wrote.  dw9768_init() is instead run
+	 * when the module is known to be powered: from dw9768_s_stream(),
+	 * which the sensor calls when it streams us, and from
+	 * dw9768_set_ctrl() as the fallback.
 	 */
-	usleep_range(DW9768_T_OPR_US, DW9768_T_OPR_US + 100);
-
-	ret = dw9768_init(dw9768);
-	if (ret < 0)
-		goto disable_regulator;
+	dw9768->initialized = false;
 
 	return 0;
-
-disable_regulator:
-	regulator_bulk_disable(ARRAY_SIZE(dw9768_supply_names),
-			       dw9768->supplies);
-
-	return ret;
 }
 
 static int dw9768_set_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct dw9768 *dw9768 = container_of(ctrl->handler,
 					     struct dw9768, ctrls);
+	struct i2c_client *client = v4l2_get_subdevdata(&dw9768->sd);
+	int ret;
 
-	if (ctrl->id == V4L2_CID_FOCUS_ABSOLUTE)
-		return dw9768_set_dac(dw9768, ctrl->val);
+	if (ctrl->id != V4L2_CID_FOCUS_ABSOLUTE)
+		return 0;
 
-	return 0;
+	/*
+	 * liuqin: while the part sits in its power-down state the DAC write
+	 * is ignored, and a resume that found the module unpowered leaves it
+	 * that way (see dw9768_runtime_resume()).  A control write always
+	 * arrives with the module powered, so retry the init here; the
+	 * sensor's stream-on (dw9768_s_stream()) normally does it first.
+	 */
+	if (!dw9768->initialized) {
+		ret = dw9768_init(dw9768);
+		if (ret < 0) {
+			dev_warn(&client->dev,
+				 "init failed (%d), lens not moved\n", ret);
+			return ret;
+		}
+
+		dw9768->initialized = true;
+	}
+
+	return dw9768_set_dac(dw9768, ctrl->val);
 }
 
 static const struct v4l2_ctrl_ops dw9768_ctrl_ops = {
@@ -385,7 +416,52 @@ static const struct v4l2_subdev_internal_ops dw9768_int_ops = {
 	.close = dw9768_close,
 };
 
-static const struct v4l2_subdev_ops dw9768_ops = { };
+/*
+ * liuqin: the focus lens is not part of the data pipeline, so the sensor
+ * driver streams this subdev when it powers (and un-powers) the module the
+ * VCM shares with it.  The init sequence only reaches the chip here - while
+ * the module is down the CCI times out - and the park on stream-stop is what
+ * keeps the coil from holding the last DAC for the rest of the session.
+ */
+static int dw9768_s_stream(struct v4l2_subdev *sd, int enable)
+{
+	struct dw9768 *dw9768 = sd_to_dw9768(sd);
+	struct i2c_client *client = v4l2_get_subdevdata(sd);
+	int ret;
+
+	if (!enable) {
+		if (dw9768->initialized) {
+			ret = dw9768_release(dw9768);
+			if (ret < 0)
+				dev_warn(&client->dev,
+					 "park failed (%d)\n", ret);
+			dw9768->initialized = false;
+		}
+
+		return 0;
+	}
+
+	if (dw9768->initialized)
+		return 0;
+
+	ret = dw9768_init(dw9768);
+	if (ret < 0) {
+		dev_warn(&client->dev, "init failed (%d)\n", ret);
+		return 0;
+	}
+
+	dw9768->initialized = true;
+
+	return 0;
+}
+
+static const struct v4l2_subdev_video_ops dw9768_video_ops = {
+	.s_stream = dw9768_s_stream,
+};
+
+static const struct v4l2_subdev_ops dw9768_ops = {
+	.video = &dw9768_video_ops,
+};
 
 static int dw9768_init_controls(struct dw9768 *dw9768)
 {
@@ -531,6 +607,7 @@ static void dw9768_remove(struct i2c_client *client)
 static const struct of_device_id dw9768_of_table[] = {
 	{ .compatible = "dongwoon,dw9768" },
 	{ .compatible = "giantec,gt9769" },
+	{ .compatible = "giantec,gt9764" },
 	{}
 };
 MODULE_DEVICE_TABLE(of, dw9768_of_table);

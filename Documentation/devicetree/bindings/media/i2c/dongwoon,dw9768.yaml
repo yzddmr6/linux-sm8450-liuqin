@@ -23,6 +23,7 @@ properties:
     enum:
       - dongwoon,dw9768 # for DW9768 VCM
       - giantec,gt9769  # for GT9769 VCM
+      - giantec,gt9764  # for GT9764 VCM
 
   reg:
     maxItems: 1

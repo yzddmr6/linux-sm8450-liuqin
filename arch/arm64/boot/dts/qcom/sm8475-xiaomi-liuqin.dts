@@ -620,6 +620,25 @@
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 
+		/*
+		 * The wide camera's autofocus rail (the dw9768's vdd/vin).
+		 * Kept always on: the VCM only answers while the sensor
+		 * module is powered anyway (the sensor driver owns the
+		 * module supplies), so gating this rail too would add a
+		 * second power state without buying anything.  The cost is
+		 * the actuator's quiescent draw while the system runs.
+		 *
+		 * Stays at its 3.0 V default: nothing writes the vendor's
+		 * 3.1 V any more, and focus works at 3.0 V.
+		 */
+		pm8350c_l7: ldo7 {
+			regulator-name = "pm8350c_l7";
+			regulator-min-microvolt = <3000000>;
+			regulator-max-microvolt = <3544000>;
+			regulator-always-on;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
 		/* FPC1264 VDD: retain the validated 2960000-3008000 uV HPM range. */
 		pm8350c_l9: ldo9 {
 			regulator-name = "pm8350c_l9";
@@ -1883,10 +1902,13 @@
 		vdda-supply = <&camera_wide_avdd_ldo>;
 		vddd-supply = <&camera_wide_dvdd_ldo>;
 		vddio-supply = <&pm8350c_l1>;
+		/* Vendor autofocus rail (l6 on this board is not the VCM). */
+		afvdd-supply = <&pm8350c_l7>;
 
 		pinctrl-names = "default";
 		pinctrl-0 = <&cam_sensor_mclk2_active &cam_sensor_active_rst0>;
 		status = "okay";
+		lens-focus = <&camera_vcm>;
 
 		port {
 			s5kjn1_ep: endpoint {
@@ -1896,6 +1918,32 @@
 				remote-endpoint = <&camss_port3_ep>;
 			};
 		};
+	};
+
+	/*
+	 * Rear module autofocus: GT9764, which uses the DW9768 register map
+	 * (AAC control at 0x02, 10-bit DAC split over 0x03/0x04, AAC
+	 * mode/prescale at 0x06 and the AAC period at 0x07).
+	 *
+	 * The vendor module data drives it with AAC enabled, AC[2:0] = 2 and
+	 * AACT[5:0] = 0x2a, i.e. exactly the values below.  The I2C address is
+	 * the family default 0x0c and has not been read back on this board
+	 * yet - if the node fails to probe, check it with an i2ctransfer
+	 * before suspecting anything else.
+	 */
+	camera_vcm: camera-lens@0c {
+		compatible = "giantec,gt9764";
+		/*
+		 * The DW9768-family default, confirmed on the always-on
+		 * bus: 0x0c ACKs (DAC reads 512), 0x11/0x16/0x26/0x28 NACK.
+		 */
+		reg = <0x0c>;
+		vin-supply = <&pm8350c_l7>;
+		vdd-supply = <&pm8350c_l7>;
+		dongwoon,aac-mode = <2>;
+		dongwoon,clock-presc = <0>;
+		dongwoon,aac-timing = <0x2a>;
+		status = "okay";
 	};
 };
 
