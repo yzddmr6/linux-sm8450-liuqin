@@ -7,6 +7,7 @@
 #include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
+#include <linux/property.h>
 #include <linux/regulator/consumer.h>
 #include <linux/units.h>
 #include <media/v4l2-cci.h>
@@ -106,6 +107,8 @@ struct s5kjn1 {
 
 	struct v4l2_subdev sd;
 	struct media_pad pad;
+
+	struct v4l2_subdev *lens;	/* DT 'lens-focus' VCM */
 
 	struct v4l2_ctrl_handler ctrl_handler;
 	struct v4l2_ctrl *link_freq;
@@ -1205,17 +1208,59 @@ error_free_hdlr:
 	return ret;
 }
 
+/*
+ * The focus lens (the VCM named by this sensor's DT 'lens-focus' reference)
+ * shares the module's power and is not part of the data pipeline, so nothing
+ * else streams it.  Take it along from here: the sensor has just powered the
+ * module, the only moment the VCM's init sequence can reach the chip; on
+ * stream-off the lens is parked while the power is still on (see dw9768.c).
+ */
+static struct v4l2_subdev *s5kjn1_get_lens(struct s5kjn1 *s5kjn1)
+{
+	struct fwnode_handle *lens_fwnode;
+	struct v4l2_subdev *subdev, *lens = NULL;
+
+	if (s5kjn1->lens)
+		return s5kjn1->lens;
+
+	lens_fwnode = fwnode_find_reference(dev_fwnode(s5kjn1->dev),
+					    "lens-focus", 0);
+	if (IS_ERR(lens_fwnode))
+		return NULL;
+
+	spin_lock(&s5kjn1->sd.v4l2_dev->lock);
+	v4l2_device_for_each_subdev(subdev, s5kjn1->sd.v4l2_dev) {
+		if (subdev->dev && dev_fwnode(subdev->dev) == lens_fwnode) {
+			lens = subdev;
+			break;
+		}
+	}
+	spin_unlock(&s5kjn1->sd.v4l2_dev->lock);
+
+	fwnode_handle_put(lens_fwnode);
+
+	s5kjn1->lens = lens;
+
+	return lens;
+}
+
 static int s5kjn1_enable_streams(struct v4l2_subdev *sd,
 				 struct v4l2_subdev_state *state, u32 pad,
 				 u64 streams_mask)
 {
 	struct s5kjn1 *s5kjn1 = to_s5kjn1(sd);
 	const struct s5kjn1_reg_list *reg_list = &s5kjn1->mode->reg_list;
+	struct v4l2_subdev *lens;
 	int ret;
 
 	ret = pm_runtime_resume_and_get(s5kjn1->dev);
 	if (ret)
 		return ret;
+
+	/* The module is powered now: bring the focus lens up with it. */
+	lens = s5kjn1_get_lens(s5kjn1);
+	if (lens)
+		v4l2_subdev_call(lens, video, s_stream, 1);
 
 	/* Page pointer */
 	cci_write(s5kjn1->regmap, CCI_REG16(0x6028), 0x4000, &ret);
@@ -1270,7 +1315,13 @@ static int s5kjn1_disable_streams(struct v4l2_subdev *sd,
 				  u64 streams_mask)
 {
 	struct s5kjn1 *s5kjn1 = to_s5kjn1(sd);
+	struct v4l2_subdev *lens;
 	int ret;
+
+	/* Park the lens while the module is still powered. */
+	lens = s5kjn1_get_lens(s5kjn1);
+	if (lens)
+		v4l2_subdev_call(lens, video, s_stream, 0);
 
 	ret = cci_write(s5kjn1->regmap, S5KJN1_REG_CTRL_MODE, 0x0, NULL);
 	if (ret)
