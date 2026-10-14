@@ -601,6 +601,11 @@ static int ath11k_pcic_ext_irq_config(struct ath11k_base *ab)
 
 		netif_napi_add(irq_grp->napi_ndev, &irq_grp->napi,
 			       ath11k_pcic_ext_grp_napi_poll);
+		/* The data path interrupts often all arrive on one CPU (one MSI
+		 * parent); threaded NAPI lets the scheduler run the rings on
+		 * other cores.
+		 */
+		netif_threaded_enable(irq_grp->napi_ndev);
 
 		if (ab->hw_params.ring_mask->tx[i] ||
 		    ab->hw_params.ring_mask->rx[i] ||
