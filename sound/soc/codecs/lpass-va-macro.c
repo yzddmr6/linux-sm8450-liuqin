@@ -1581,12 +1581,8 @@ static int va_macro_probe(struct platform_device *pdev)
 		clk_set_rate(va->npl, 2 * VA_MACRO_MCLK_FREQ);
 	}
 
-	ret = devm_pm_clk_create(dev);
+	ret = lpass_macro_pm_clk_create(dev);
 	if (ret)
-		goto err;
-
-	ret = of_pm_clk_add_clks(dev);
-	if (ret < 0)
 		goto err;
 
 	pm_runtime_set_autosuspend_delay(dev, 100);

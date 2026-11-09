@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (c) 2022, The Linux Foundation. All rights reserved.
 
+#include <linux/clk.h>
 #include <linux/export.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_clock.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 
@@ -13,6 +15,37 @@
 
 static DEFINE_MUTEX(lpass_codec_mutex);
 static enum lpass_codec_version lpass_codec_version;
+
+/* Block votes must precede functional clocks, regardless of DT ordering. */
+int lpass_macro_pm_clk_create(struct device *dev)
+{
+	static const char * const names[] = {
+		"macro", "dcodec", "mclk", "npl", "fsgen",
+	};
+	int i, ret;
+
+	ret = devm_pm_clk_create(dev);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		struct clk *clk = clk_get_optional(dev, names[i]);
+
+		if (IS_ERR(clk))
+			return PTR_ERR(clk);
+		if (!clk)
+			continue;
+
+		ret = pm_clk_add_clk(dev, clk);
+		if (ret) {
+			clk_put(clk);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(lpass_macro_pm_clk_create);
 
 struct lpass_macro *lpass_macro_pds_init(struct device *dev)
 {

@@ -3865,12 +3865,8 @@ static int rx_macro_probe(struct platform_device *pdev)
 	clk_set_rate(rx->mclk, MCLK_FREQ);
 	clk_set_rate(rx->npl, MCLK_FREQ);
 
-	ret = devm_pm_clk_create(dev);
+	ret = lpass_macro_pm_clk_create(dev);
 	if (ret)
-		return ret;
-
-	ret = of_pm_clk_add_clks(dev);
-	if (ret < 0)
 		return ret;
 
 	pm_runtime_set_autosuspend_delay(dev, 100);

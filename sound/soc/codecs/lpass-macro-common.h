@@ -36,6 +36,7 @@ struct lpass_macro {
 	struct device *dcodec_pd;
 };
 
+int lpass_macro_pm_clk_create(struct device *dev);
 struct lpass_macro *lpass_macro_pds_init(struct device *dev);
 void lpass_macro_pds_exit(struct lpass_macro *pds);
 void lpass_macro_set_codec_version(enum lpass_codec_version version);
