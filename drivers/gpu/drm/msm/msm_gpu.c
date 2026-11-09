@@ -433,6 +433,36 @@ find_submit(struct msm_ringbuffer *ring, uint32_t fence)
 
 static void retire_submits(struct msm_gpu *gpu);
 
+/* Only call after the GPU can no longer access the submitted buffers. */
+void msm_gpu_fail_submits(struct msm_gpu *gpu)
+{
+	int i;
+
+	lockdep_assert_held(&gpu->lock);
+
+	for (i = 0; i < gpu->nr_rings; i++) {
+		struct msm_ringbuffer *ring = gpu->rb[i];
+		struct msm_gem_submit *submit;
+		unsigned long flags;
+
+		spin_lock_irqsave(&ring->submit_lock, flags);
+		list_for_each_entry(submit, &ring->submits, node) {
+			struct dma_fence *fence = submit->hw_fence;
+
+			spin_lock(fence->lock);
+			if (!dma_fence_is_signaled_locked(fence)) {
+				dma_fence_set_error(fence, -EIO);
+				dma_fence_signal_locked(fence);
+			}
+			spin_unlock(fence->lock);
+		}
+		spin_unlock_irqrestore(&ring->submit_lock, flags);
+
+		ring->memptrs->fence = ring->fctx->last_fence;
+		msm_update_fence(ring->fctx, ring->fctx->last_fence);
+	}
+}
+
 static void get_comm_cmdline(struct msm_gem_submit *submit, char **comm, char **cmd)
 {
 	struct msm_context *ctx = submit->queue->ctx;
@@ -463,11 +493,16 @@ static void recover_worker(struct kthread_work *work)
 	struct drm_device *dev = gpu->dev;
 	struct msm_drm_private *priv = dev->dev_private;
 	struct msm_gem_submit *submit;
-	struct msm_ringbuffer *cur_ring = gpu->funcs->active_ring(gpu);
+	struct msm_ringbuffer *cur_ring;
 	char *comm = NULL, *cmd = NULL;
 	int i;
 
 	mutex_lock(&gpu->lock);
+
+	if (gpu->wedged)
+		goto out_unlock;
+
+	cur_ring = gpu->funcs->active_ring(gpu);
 
 	DRM_DEV_ERROR(dev->dev, "%s: hangcheck recover!\n", gpu->name);
 
@@ -518,6 +553,10 @@ static void recover_worker(struct kthread_work *work)
 	kfree(cmd);
 	kfree(comm);
 
+	gpu->funcs->recover(gpu);
+	if (gpu->wedged)
+		goto out_pm;
+
 	/*
 	 * Update all the rings with the latest and greatest fence.. this
 	 * needs to happen after msm_rd_dump_submit() to ensure that the
@@ -538,8 +577,6 @@ static void recover_worker(struct kthread_work *work)
 		msm_update_fence(ring->fctx, fence);
 	}
 
-	gpu->funcs->recover(gpu);
-
 	/* retire completed submits, plus the one that hung: */
 	retire_submits(gpu);
 
@@ -557,6 +594,7 @@ static void recover_worker(struct kthread_work *work)
 		spin_unlock_irqrestore(&ring->submit_lock, flags);
 	}
 
+out_pm:
 	pm_runtime_put(&gpu->pdev->dev);
 
 out_unlock:
@@ -568,10 +606,15 @@ out_unlock:
 void msm_gpu_fault_crashstate_capture(struct msm_gpu *gpu, struct msm_gpu_fault_info *fault_info)
 {
 	struct msm_gem_submit *submit;
-	struct msm_ringbuffer *cur_ring = gpu->funcs->active_ring(gpu);
+	struct msm_ringbuffer *cur_ring;
 	char *comm = NULL, *cmd = NULL;
 
 	mutex_lock(&gpu->lock);
+
+	if (gpu->wedged)
+		goto resume_smmu;
+
+	cur_ring = gpu->funcs->active_ring(gpu);
 
 	submit = find_submit(cur_ring, cur_ring->memptrs->fence + 1);
 	if (submit && submit->fault_dumped)
@@ -625,8 +668,14 @@ static void hangcheck_handler(struct timer_list *t)
 {
 	struct msm_gpu *gpu = timer_container_of(gpu, t, hangcheck_timer);
 	struct drm_device *dev = gpu->dev;
-	struct msm_ringbuffer *ring = gpu->funcs->active_ring(gpu);
-	uint32_t fence = ring->memptrs->fence;
+	struct msm_ringbuffer *ring;
+	u32 fence;
+
+	if (READ_ONCE(gpu->wedged))
+		return;
+
+	ring = gpu->funcs->active_ring(gpu);
+	fence = ring->memptrs->fence;
 
 	if (fence != ring->hangcheck_fence) {
 		/* some progress has been made.. ya! */
@@ -859,16 +908,25 @@ void msm_gpu_retire(struct msm_gpu *gpu)
 }
 
 /* add bo's to gpu's ring, and kick gpu: */
-void msm_gpu_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
+int msm_gpu_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 {
 	struct msm_ringbuffer *ring = submit->ring;
 	unsigned long flags;
+	int ret;
 
 	WARN_ON(!mutex_is_locked(&gpu->lock));
 
-	pm_runtime_get_sync(&gpu->pdev->dev);
+	ret = pm_runtime_resume_and_get(&gpu->pdev->dev);
+	if (ret < 0)
+		return ret;
 
-	msm_gpu_hw_init(gpu);
+	ret = msm_gpu_hw_init(gpu);
+	if (ret) {
+		pm_runtime_put(&gpu->pdev->dev);
+		return ret;
+	}
+
+	msm_fence_init(submit->hw_fence, ring->fctx);
 
 	submit->seqno = submit->hw_fence->seqno;
 
@@ -898,6 +956,8 @@ void msm_gpu_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 
 	pm_runtime_put(&gpu->pdev->dev);
 	hangcheck_timer_reset(gpu);
+
+	return 0;
 }
 
 /*

@@ -1439,12 +1439,44 @@ static void a6xx_dump(struct msm_gpu *gpu)
 	adreno_dump(gpu);
 }
 
+/* Drop and restore the two recovery references without waking the GPU. */
+static int a6xx_recover_suspend(struct msm_gpu *gpu, int active_submits)
+{
+	struct a6xx_gmu *gmu = &to_a6xx_gpu(to_adreno_gpu(gpu))->gmu;
+	struct device *dev = &gpu->pdev->dev;
+	int ret;
+
+	reinit_completion(&gmu->pd_gate);
+	ret = dev_pm_genpd_add_notifier(gmu->cxpd, &gmu->pd_nb);
+	if (ret)
+		return ret;
+
+	dev_pm_genpd_synced_poweroff(gmu->cxpd);
+
+	if (active_submits)
+		pm_runtime_put_noidle(dev);
+	ret = pm_runtime_put_sync_suspend(dev);
+
+	if (ret >= 0 &&
+	    !wait_for_completion_timeout(&gmu->pd_gate, msecs_to_jiffies(1000)))
+		ret = -ETIMEDOUT;
+
+	dev_pm_genpd_remove_notifier(gmu->cxpd);
+
+	if (active_submits)
+		pm_runtime_get_noresume(dev);
+	pm_runtime_get_noresume(dev);
+
+	return ret < 0 ? ret : 0;
+}
+
 static void a6xx_recover(struct msm_gpu *gpu)
 {
 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
 	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
 	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
-	int i, active_submits;
+	int i, active_submits, ret;
+	bool quiesced = false;
 
 	adreno_dump_info(gpu);
 
@@ -1485,34 +1517,41 @@ static void a6xx_recover(struct msm_gpu *gpu)
 		a6xx_gpu_sw_reset(gpu, false);
 	}
 
-	reinit_completion(&gmu->pd_gate);
-	dev_pm_genpd_add_notifier(gmu->cxpd, &gmu->pd_nb);
-	dev_pm_genpd_synced_poweroff(gmu->cxpd);
+	ret = a6xx_recover_suspend(gpu, active_submits);
+	if (ret)
+		goto failed;
 
-	/* Drop the rpm refcount from active submits */
-	if (active_submits)
-		pm_runtime_put(&gpu->pdev->dev);
+	/* No submitted commands can survive a confirmed CX power collapse. */
+	quiesced = true;
+	ret = pm_runtime_resume(&gpu->pdev->dev);
+	if (ret < 0)
+		goto failed;
 
-	/* And the final one from recover worker */
-	pm_runtime_put_sync(&gpu->pdev->dev);
+	quiesced = false;
+	ret = msm_gpu_hw_init(gpu);
+	if (ret) {
+		/* hw_init may have started the CP; stop it before ending fences. */
+		gmu->hung = true;
+		quiesced = !a6xx_recover_suspend(gpu, active_submits);
+		goto failed;
+	}
 
-	if (!wait_for_completion_timeout(&gmu->pd_gate, msecs_to_jiffies(1000)))
-		DRM_DEV_ERROR(&gpu->pdev->dev, "cx gdsc didn't collapse\n");
+	a6xx_gpu->hung = false;
+	goto out;
 
-	dev_pm_genpd_remove_notifier(gmu->cxpd);
-
-	pm_runtime_use_autosuspend(&gpu->pdev->dev);
-
-	if (active_submits)
-		pm_runtime_get(&gpu->pdev->dev);
-
-	pm_runtime_get_sync(&gpu->pdev->dev);
-
+failed:
+	WRITE_ONCE(gpu->wedged, true);
+	timer_delete_sync(&gpu->hangcheck_timer);
+	DRM_DEV_ERROR(&gpu->pdev->dev, "GPU recovery failed: %d; device wedged\n", ret);
+	if (quiesced)
+		msm_gpu_fail_submits(gpu);
+	else
+		DRM_DEV_ERROR(&gpu->pdev->dev,
+			      "GPU not quiescent; retaining pending fences and buffers\n");
+out:
 	gpu->active_submits = active_submits;
 	mutex_unlock(&gpu->active_lock);
-
-	msm_gpu_hw_init(gpu);
-	a6xx_gpu->hung = false;
+	pm_runtime_use_autosuspend(&gpu->pdev->dev);
 }
 
 static const char *a6xx_uche_fault_block(struct msm_gpu *gpu, u32 mid)

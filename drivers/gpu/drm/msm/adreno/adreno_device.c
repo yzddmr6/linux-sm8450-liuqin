@@ -298,6 +298,9 @@ static int adreno_runtime_resume(struct device *dev)
 {
 	struct msm_gpu *gpu = dev_to_gpu(dev);
 
+	if (READ_ONCE(gpu->wedged))
+		return -EIO;
+
 	return gpu->funcs->pm_resume(gpu);
 }
 
