@@ -723,6 +723,16 @@ config VIDEO_S5KJN1
 	  To compile this driver as a module, choose M here: the
 	  module will be called s5kjn1.
 
+config VIDEO_SC202CS
+	tristate "SmartSens SC202CS sensor support"
+	select V4L2_CCI_I2C
+	help
+	  This is a V4L2 sensor driver for the SmartSens SC202CS 2MP
+	  depth camera sensor.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called sc202cs.
+
 config VIDEO_VD55G1
 	tristate "ST VD55G1 sensor support"
 	select V4L2_CCI_I2C

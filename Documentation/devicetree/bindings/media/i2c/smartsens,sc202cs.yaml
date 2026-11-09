@@ -1,0 +1,110 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/i2c/smartsens,sc202cs.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: SmartSens SC202CS Image Sensor
+
+description:
+  The SmartSens SC202CS is a 2MP depth image sensor.  It is controlled over
+  a serial camera control bus and outputs RAW10 data over a single-lane
+  MIPI D-PHY interface.
+
+maintainers:
+  - Linux Media maintainers <linux-media@vger.kernel.org>
+
+allOf:
+  - $ref: /schemas/media/video-interface-devices.yaml#
+
+properties:
+  compatible:
+    const: smartsens,sc202cs
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    description: 19.2 MHz sensor master clock.
+    maxItems: 1
+
+  clock-names:
+    items:
+      - const: xvclk
+
+  reset-gpios:
+    description: Active low GPIO connected to the RESET pad of the sensor.
+    maxItems: 1
+
+  vdda-supply:
+    description: Optional analogue sensor supply.
+
+  vddd-supply:
+    description: Optional digital core supply.
+
+  vddio-supply:
+    description: Optional digital I/O supply.
+
+  port:
+    $ref: /schemas/graph.yaml#/$defs/port-base
+    additionalProperties: false
+
+    properties:
+      endpoint:
+        $ref: /schemas/media/video-interfaces.yaml#
+        unevaluatedProperties: false
+
+        properties:
+          clock-lanes:
+            maxItems: 1
+
+          data-lanes:
+            minItems: 1
+            maxItems: 4
+
+          link-frequencies:
+            minItems: 1
+
+        required:
+          - data-lanes
+          - link-frequencies
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - clock-names
+  - port
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        camera@36 {
+            compatible = "smartsens,sc202cs";
+            reg = <0x36>;
+            clocks = <&camcc 0>;
+            clock-names = "xvclk";
+            assigned-clocks = <&camcc 0>;
+            assigned-clock-rates = <19200000>;
+            reset-gpios = <&tlmm 24 GPIO_ACTIVE_LOW>;
+            vdda-supply = <&vreg_2p8>;
+            vddio-supply = <&vreg_1p8>;
+
+            port {
+                endpoint {
+                    clock-lanes = <0>;
+                    data-lanes = <1>;
+                    link-frequencies = /bits/ 64 <360000000>;
+                    remote-endpoint = <&mipi_csi2_ep>;
+                };
+            };
+        };
+    };
+...
