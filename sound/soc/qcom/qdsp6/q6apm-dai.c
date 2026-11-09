@@ -53,6 +53,7 @@ enum stream_state {
 	Q6APM_STREAM_IDLE = 0,
 	Q6APM_STREAM_STOPPED,
 	Q6APM_STREAM_RUNNING,
+	Q6APM_STREAM_PREPARED,
 };
 
 struct q6apm_dai_rtd {
@@ -266,18 +267,15 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
 		return ret;
 	}
 
+	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
+		prtd->state = Q6APM_STREAM_PREPARED;
+		return 0;
+	}
+
 	ret = q6apm_graph_start(prtd->graph);
 	if (ret) {
 		dev_err(dev, "Failed to Start Graph %d\n", ret);
 		return ret;
-	}
-
-	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
-		int i;
-		/* Queue the buffers for Capture ONLY after graph is started */
-		for (i = 0; i < runtime->periods; i++)
-			q6apm_read(prtd->graph);
-
 	}
 
 	/* The DSP graph is running: allow the client's initial buffer prefill. */
@@ -315,12 +313,24 @@ static int q6apm_dai_trigger(struct snd_soc_component *component,
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct q6apm_dai_rtd *prtd = runtime->private_data;
-	int ret = 0;
+	int i, ret = 0;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE &&
+		    prtd->state == Q6APM_STREAM_PREPARED) {
+			ret = q6apm_graph_start(prtd->graph);
+			if (ret)
+				return ret;
+
+			for (i = 0; i < runtime->periods; i++) {
+				ret = q6apm_read(prtd->graph);
+				if (ret < 0)
+					return ret;
+			}
+		}
 		prtd->state = Q6APM_STREAM_RUNNING;
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:

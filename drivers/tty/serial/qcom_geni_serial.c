@@ -2015,6 +2015,7 @@ static int __maybe_unused qcom_geni_serial_runtime_resume(struct device *dev)
 
 static int qcom_geni_serial_suspend(struct device *dev)
 {
+	int ret;
 	struct qcom_geni_serial_port *port = dev_get_drvdata(dev);
 	struct uart_port *uport = &port->uport;
 	struct qcom_geni_private_data *private_data = uport->private_data;
@@ -2027,7 +2028,22 @@ static int qcom_geni_serial_suspend(struct device *dev)
 		geni_icc_set_tag(&port->se, QCOM_ICC_TAG_ACTIVE_ONLY);
 		geni_icc_set_bw(&port->se);
 	}
-	return uart_suspend_port(private_data->drv, uport);
+
+	/*
+	 * uart_suspend_port() marks the port suspended before it stops and
+	 * shuts it down, and the interrupt handler returns IRQ_NONE for a
+	 * suspended port without clearing anything. An event raised in that
+	 * window, such as the completion of the receive cancel, keeps this
+	 * level-triggered interrupt asserted until the spurious-interrupt
+	 * detector disables the line for good. Keep the line masked across
+	 * the transition; resume unmasks it once the port runs again, and the
+	 * pending events are handled then.
+	 */
+	disable_irq(uport->irq);
+	ret = uart_suspend_port(private_data->drv, uport);
+	if (ret)
+		enable_irq(uport->irq);
+	return ret;
 }
 
 static int qcom_geni_serial_resume(struct device *dev)
@@ -2038,6 +2054,7 @@ static int qcom_geni_serial_resume(struct device *dev)
 	struct qcom_geni_private_data *private_data = uport->private_data;
 
 	ret = uart_resume_port(private_data->drv, uport);
+	enable_irq(uport->irq);
 	if (uart_console(uport)) {
 		geni_icc_set_tag(&port->se, QCOM_ICC_TAG_ALWAYS);
 		geni_icc_set_bw(&port->se);

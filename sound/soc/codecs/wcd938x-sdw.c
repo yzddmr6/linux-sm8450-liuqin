@@ -186,16 +186,27 @@ static int wcd9380_interrupt_callback(struct sdw_slave *slave,
 	struct wcd938x_sdw_priv *wcd = dev_get_drvdata(&slave->dev);
 	struct irq_domain *slave_irq = wcd->slave_irq;
 	u32 sts1, sts2, sts3;
+	int ret;
 
 	do {
 		handle_nested_irq(irq_find_mapping(slave_irq, 0));
-		regmap_read(wcd->regmap, WCD938X_DIGITAL_INTR_STATUS_0, &sts1);
-		regmap_read(wcd->regmap, WCD938X_DIGITAL_INTR_STATUS_1, &sts2);
-		regmap_read(wcd->regmap, WCD938X_DIGITAL_INTR_STATUS_2, &sts3);
+
+		/* RX has no local regmap; its interrupt is handled above. */
+		if (!wcd->regmap)
+			return 0;
+		ret = regmap_read(wcd->regmap, WCD938X_DIGITAL_INTR_STATUS_0, &sts1);
+		if (ret)
+			return ret;
+		ret = regmap_read(wcd->regmap, WCD938X_DIGITAL_INTR_STATUS_1, &sts2);
+		if (ret)
+			return ret;
+		ret = regmap_read(wcd->regmap, WCD938X_DIGITAL_INTR_STATUS_2, &sts3);
+		if (ret)
+			return ret;
 
 	} while (sts1 || sts2 || sts3);
 
-	return IRQ_HANDLED;
+	return 0;
 }
 
 static const struct reg_default wcd938x_defaults[] = {

@@ -560,6 +560,9 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
 	if (!gpu)
 		return -ENXIO;
 
+	if (READ_ONCE(gpu->wedged))
+		return -EIO;
+
 	if (args->pad)
 		return -EINVAL;
 

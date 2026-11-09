@@ -28,6 +28,15 @@ struct apm_graph_mgmt_cmd {
 #define APM_GRAPH_MGMT_PSIZE(p, n) ALIGN(struct_size(p, sub_graph_id_list, n), 8)
 
 static struct q6apm *g_apm;
+static DEFINE_MUTEX(g_apm_lock);
+
+static void q6apm_clear_global(struct q6apm *apm)
+{
+	mutex_lock(&g_apm_lock);
+	if (g_apm == apm)
+		g_apm = NULL;
+	mutex_unlock(&g_apm_lock);
+}
 
 int q6apm_send_cmd_sync(struct q6apm *apm, struct gpr_pkt *pkt, uint32_t rsp_opcode)
 {
@@ -157,24 +166,35 @@ static void q6apm_put_audioreach_graph(struct kref *ref)
 static int q6apm_get_apm_state(struct q6apm *apm)
 {
 	struct gpr_pkt *pkt;
+	int ret;
 
 	pkt = audioreach_alloc_apm_cmd_pkt(0, APM_CMD_GET_SPF_STATE, 0);
 	if (IS_ERR(pkt))
 		return PTR_ERR(pkt);
 
-	q6apm_send_cmd_sync(apm, pkt, APM_CMD_RSP_GET_SPF_STATE);
+	ret = q6apm_send_cmd_sync(apm, pkt, APM_CMD_RSP_GET_SPF_STATE);
 
 	kfree(pkt);
+	if (ret < 0)
+		return ret;
 
 	return apm->state;
 }
 
 bool q6apm_is_adsp_ready(void)
 {
-	if (g_apm)
-		return q6apm_get_apm_state(g_apm);
+	bool ready = false;
 
-	return false;
+	/*
+	 * A DSP restart removes the APM device. Keep it alive for the whole
+	 * query, including the synchronous command's wait for a reply.
+	 */
+	mutex_lock(&g_apm_lock);
+	if (g_apm)
+		ready = q6apm_get_apm_state(g_apm) > 0;
+	mutex_unlock(&g_apm_lock);
+
+	return ready;
 }
 EXPORT_SYMBOL_GPL(q6apm_is_adsp_ready);
 
@@ -696,20 +716,26 @@ EXPORT_SYMBOL_GPL(q6apm_graph_prepare);
 int q6apm_graph_start(struct q6apm_graph *graph)
 {
 	struct audioreach_graph *ar_graph = graph->ar_graph;
-	int ret = 0;
+	int ret;
 
-	if (ar_graph->start_count == 0)
+	if (ar_graph->start_count == 0) {
 		ret = audioreach_graph_mgmt_cmd(ar_graph, APM_CMD_GRAPH_START);
+		if (ret)
+			return ret;
+	}
 
 	ar_graph->start_count++;
 
-	return ret;
+	return 0;
 }
 EXPORT_SYMBOL_GPL(q6apm_graph_start);
 
 int q6apm_graph_stop(struct q6apm_graph *graph)
 {
 	struct audioreach_graph *ar_graph = graph->ar_graph;
+
+	if (ar_graph->start_count == 0)
+		return 0;
 
 	if (--ar_graph->start_count > 0)
 		return 0;
@@ -768,8 +794,6 @@ static int apm_probe(gpr_device_t *gdev)
 
 	idr_init(&apm->modules_idr);
 
-	g_apm = apm;
-
 	q6apm_get_apm_state(apm);
 
 	ret = devm_snd_soc_register_component(dev, &q6apm_audio_component, NULL, 0);
@@ -778,7 +802,20 @@ static int apm_probe(gpr_device_t *gdev)
 		return ret;
 	}
 
-	return of_platform_populate(dev->of_node, NULL, NULL, dev);
+	mutex_lock(&g_apm_lock);
+	g_apm = apm;
+	mutex_unlock(&g_apm_lock);
+
+	ret = of_platform_populate(dev->of_node, NULL, NULL, dev);
+	if (ret)
+		q6apm_clear_global(apm);
+
+	return ret;
+}
+
+static void apm_remove(gpr_device_t *gdev)
+{
+	q6apm_clear_global(dev_get_drvdata(&gdev->dev));
 }
 
 struct audioreach_module *q6apm_find_module_by_mid(struct q6apm_graph *graph, uint32_t mid)
@@ -845,6 +882,7 @@ MODULE_DEVICE_TABLE(of, apm_device_id);
 
 static gpr_driver_t apm_driver = {
 	.probe = apm_probe,
+	.remove = apm_remove,
 	.gpr_callback = apm_callback,
 	.driver = {
 		.name = "qcom-apm",
