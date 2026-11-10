@@ -2130,3 +2130,8 @@
 		};
 	};
 };
+
+/* RAM standby candidate: qce holds an ALWAYS DDR vote without PM callbacks. */
+&crypto {
+	status = "disabled";
+};
