@@ -513,6 +513,24 @@
 		enable-active-high;
 		startup-delay-us = <100>;
 	};
+	camera_front_avdd_ldo: regulator-camera-front-avdd {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_front_avdd_ldo";
+		regulator-min-microvolt = <2900000>;
+		regulator-max-microvolt = <2900000>;
+		gpio = <&tlmm 119 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <100000>;
+	};
+
+	camera_front_dvdd_ldo: regulator-camera-front-dvdd {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_front_dvdd_ldo";
+		regulator-min-microvolt = <1100000>;
+		regulator-max-microvolt = <1100000>;
+		gpio = <&tlmm 74 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
 };
 
 &apps_rsc {
@@ -1465,6 +1483,21 @@
 		bias-disable;
 	};
 
+
+	cam_sensor_mclk5_active: cam-sensor-mclk5-active-state {
+		pins = "gpio105";
+		function = "cam_mclk";
+		drive-strength = <4>;
+		bias-disable;
+	};
+
+	cam_sensor_active_rst5: cam-sensor-active-rst5-state {
+		pins = "gpio127";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
 	cam_sensor_active_rst0: cam-sensor-active-rst0-state {
 		pins = "gpio126";
 		function = "gpio";
@@ -1863,6 +1896,41 @@
 	status = "okay";
 };
 
+&cci0_i2c0 {
+	status = "okay";
+
+	camera@10 {
+		compatible = "sony,imx596";
+		reg = <0x10>;
+		orientation = <0>;
+		rotation = <180>;
+
+		power-domains = <&camcc TITAN_TOP_GDSC>;
+
+		clocks = <&camcc CAM_CC_MCLK5_CLK>;
+		clock-names = "xvclk";
+		assigned-clocks = <&camcc CAM_CC_MCLK5_CLK>;
+		assigned-clock-rates = <19200000>;
+
+		reset-gpios = <&tlmm 127 GPIO_ACTIVE_LOW>;
+		vdda-supply = <&camera_front_avdd_ldo>;
+		vddd-supply = <&camera_front_dvdd_ldo>;
+		vddio-supply = <&pm8350c_l1>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_sensor_mclk5_active &cam_sensor_active_rst5>;
+
+		port {
+			imx596_ep: endpoint {
+				link-frequencies = /bits/ 64 <678400000>;
+				clock-lanes = <0>;
+				data-lanes = <1 2 3 4>;
+				remote-endpoint = <&camss_port2_ep>;
+			};
+		};
+	};
+};
+
 &cci0_i2c1 {
 	status = "okay";
 
@@ -1900,7 +1968,7 @@
 };
 
 /*
- * SM8475/Cape CAMSS path for the rear S5KJN1.
+ * SM8475/Cape CAMSS paths for the front IMX596 and rear S5KJN1.
  * Runtime resources are derived from Qualcomm Cape/waipio camera DT.
  */
 &soc {
@@ -1981,6 +2049,17 @@
 		ports {
 			#address-cells = <1>;
 			#size-cells = <0>;
+
+			port@2 {
+				reg = <2>;
+
+				camss_port2_ep: endpoint {
+					link-frequencies = /bits/ 64 <678400000>;
+					clock-lanes = <7>;
+					data-lanes = <0 1 2 3>;
+					remote-endpoint = <&imx596_ep>;
+				};
+			};
 
 			port@3 {
 				reg = <3>;
