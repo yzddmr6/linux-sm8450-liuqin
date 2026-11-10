@@ -1484,6 +1484,10 @@
 	};
 
 
+	/*
+	 * The front sensor's MCLK5 is wired to GPIO 105. Board pinctrl
+	 * keeps this independent of Linux I2C adapter numbering.
+	 */
 	cam_sensor_mclk5_active: cam-sensor-mclk5-active-state {
 		pins = "gpio105";
 		function = "cam_mclk";
