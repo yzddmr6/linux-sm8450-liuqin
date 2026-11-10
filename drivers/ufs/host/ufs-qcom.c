@@ -352,6 +352,9 @@ static int ufs_qcom_enable_lane_clks(struct ufs_qcom_host *host)
 {
 	int err;
 
+	if (host->is_lane_clks_enabled)
+		return 0;
+
 	err = clk_bulk_prepare_enable(host->num_clks, host->clks);
 	if (err)
 		return err;
@@ -369,11 +372,21 @@ static int ufs_qcom_init_lane_clks(struct ufs_qcom_host *host)
 	if (has_acpi_companion(dev))
 		return 0;
 
-	err = devm_clk_bulk_get_all(dev, &host->clks);
-	if (err <= 0)
-		return err;
+	/* The core owns all non-lane clocks; do not acquire them twice. */
+	host->num_clks = host->hba->lanes_per_direction > 1 ? 3 : 2;
+	host->clks = devm_kcalloc(dev, host->num_clks, sizeof(*host->clks),
+				 GFP_KERNEL);
+	if (!host->clks)
+		return -ENOMEM;
 
-	host->num_clks = err;
+	host->clks[0].id = "tx_lane0_sync_clk";
+	host->clks[1].id = "rx_lane0_sync_clk";
+	if (host->num_clks > 2)
+		host->clks[2].id = "rx_lane1_sync_clk";
+
+	err = devm_clk_bulk_get(dev, host->num_clks, host->clks);
+	if (err)
+		return dev_err_probe(dev, err, "failed to get lane clocks\n");
 
 	return 0;
 }
