@@ -1104,9 +1104,16 @@ static struct attribute *qcom_battmgr_xiaomi_attrs[] = {
 static umode_t qcom_battmgr_xiaomi_attr_visible(struct kobject *kobj,
 					       struct attribute *attr, int index)
 {
+	const char *model;
+
 	if (attr == &dev_attr_thermal_level_requested.attr &&
-	    !of_machine_is_compatible("xiaomi,liuqin"))
-		return 0;
+	    !of_machine_is_compatible("xiaomi,liuqin")) {
+		/* The stock M81 ABL replaces the root compatible at handoff. */
+		if (!of_machine_is_compatible("qcom,cape-mtp") ||
+		    of_property_read_string(of_root, "model", &model) ||
+		    strcmp(model, "Liuqin based on Qualcomm Technologies, Inc SM8475"))
+			return 0;
+	}
 	return attr->mode;
 }
 
