@@ -108,9 +108,10 @@ enum qcom_battmgr_variant {
 #define XM_PD_VERIFIED			19
 #define XM_PDO2			20
 #define XM_FASTCHG_MODE			38
-#define XM_QUICK_CHARGE_TYPE		42
-#define XM_APDO_MAX			43
-#define XM_POWER_MAX			44
+/* M81 inserts BLANK_STATUS/SCREEN_CCTOG at 40/41 before SOC_DECIMAL. */
+#define XM_QUICK_CHARGE_TYPE		44
+#define XM_APDO_MAX			45
+#define XM_POWER_MAX			46
 /* Additional XM properties used by the adapter/battery authentication path. */
 #define XM_VERIFY_DIGEST		1
 #define XM_VDM_CHARGER_VERSION		8
@@ -429,6 +430,7 @@ struct qcom_battmgr {
 	int liuqin_level_generation;
 
 	struct work_struct enable_work;
+	struct work_struct xm_notify_work;
 	struct delayed_work refresh_work;
 	struct iio_channel *connector; /* acquired by connector_work */
 	bool connector_enabled;
@@ -1866,6 +1868,15 @@ static void qcom_battmgr_online_response(struct qcom_battmgr *b, u8 mask, u8 onl
 	qcom_battmgr_connector_gate(b);
 }
 
+/* Like the OEM xm_prop_change_work, publish vendor state outside GLINK RX. */
+static void qcom_battmgr_xm_notify_worker(struct work_struct *work)
+{
+	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr,
+						 xm_notify_work);
+
+	kobject_uevent(&battmgr->dev->kobj, KOBJ_CHANGE);
+}
+
 static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 				      const struct qcom_battmgr_message *msg,
 				      int len)
@@ -1899,8 +1910,10 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 		power_supply_changed(battmgr->wls_psy);
 		break;
 	case NOTIF_XM_PROPERTY:
-		if (battmgr->variant == QCOM_BATTMGR_SM8475)
+		if (battmgr->variant == QCOM_BATTMGR_SM8475) {
+			schedule_work(&battmgr->xm_notify_work);
 			break;
+		}
 		fallthrough;
 	default:
 		dev_err(battmgr->dev, "unknown notification: %#x\n", notification);
@@ -2470,6 +2483,8 @@ static void qcom_battmgr_stop_workers(void *data)
 
 	disable_work_sync(&b->online_work);
 	disable_work_sync(&b->enable_work);
+	/* A disabled work cannot be requeued by a late RX before the client goes. */
+	disable_work_sync(&b->xm_notify_work);
 	disable_delayed_work_sync(&b->connector_work);
 	/* Cancel the refresher before devres releases its GLINK client. */
 	disable_delayed_work_sync(&b->refresh_work);
@@ -2599,6 +2614,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 		return ret;
 	INIT_WORK(&battmgr->online_work, qcom_battmgr_check_online);
 	INIT_WORK(&battmgr->enable_work, qcom_battmgr_enable_worker);
+	INIT_WORK(&battmgr->xm_notify_work, qcom_battmgr_xm_notify_worker);
 	INIT_DELAYED_WORK(&battmgr->refresh_work, qcom_battmgr_sm8475_refresh_worker);
 	mutex_init(&battmgr->lock);
 	init_completion(&battmgr->ack);
