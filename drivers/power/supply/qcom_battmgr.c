@@ -3,6 +3,7 @@
  * Copyright (c) 2019-2020, The Linux Foundation. All rights reserved.
  * Copyright (c) 2022, Linaro Ltd
  */
+#include <linux/of.h>
 #include <linux/unaligned.h>
 #include <linux/auxiliary_bus.h>
 #include <linux/ctype.h>
