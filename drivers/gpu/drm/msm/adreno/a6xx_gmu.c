@@ -1565,6 +1565,56 @@ static int a6xx_gmu_rpmh_arc_votes_init(struct device *dev, u32 *votes,
 	return 0;
 }
 
+/* On Gen7 the second GX perf-table word can carry a dependent CX HLVL. */
+static int a6xx_gmu_gx_cx_votes_init(struct device *dev, struct a6xx_gmu *gmu)
+{
+	const __le16 *levels = NULL;
+	size_t bytes;
+	int i, j, count = 0;
+
+	for (i = 1; i < gmu->nr_gpu_freqs; i++) {
+		struct dev_pm_opp *opp;
+		struct device_node *np;
+		u32 corner;
+		int ret;
+
+		opp = dev_pm_opp_find_freq_exact(dev, gmu->gpu_freqs[i], true);
+		if (IS_ERR(opp))
+			return PTR_ERR(opp);
+		np = dev_pm_opp_get_of_node(opp);
+		dev_pm_opp_put(opp);
+		if (!of_property_present(np, "qcom,opp-cx-level")) {
+			of_node_put(np);
+			continue;
+		}
+		ret = of_property_read_u32(np, "qcom,opp-cx-level", &corner);
+		of_node_put(np);
+		if (ret)
+			return ret;
+		if (!levels) {
+			levels = cmd_db_read_aux_data("cx.lvl", &bytes);
+			if (IS_ERR(levels))
+				return PTR_ERR(levels);
+			if (!levels || !bytes || !IS_ALIGNED(bytes, sizeof(*levels)))
+				return -EINVAL;
+		}
+		for (j = 0; j < bytes / sizeof(*levels); j++)
+			if (le16_to_cpu(levels[j]) >= corner)
+				break;
+		if (j == bytes / sizeof(*levels))
+			return dev_err_probe(dev, -EINVAL, "unsupported GPU CX corner %u\n", corner);
+		gmu->gx_cx_votes[i] = j;
+		count++;
+	}
+
+	if (count && count != gmu->nr_gpu_freqs - 1)
+		return dev_err_probe(dev, -EINVAL, "incomplete GPU CX dependency table\n");
+
+	/* Entry zero is the power-off vote and is zero-initialized. */
+	gmu->has_gx_cx_votes = count != 0;
+	return 0;
+}
+
 /*
  * The GMU votes with the RPMh for itself and on behalf of the GPU but we need
  * to construct the list of votes on the CPU and send it over. Query the RPMh
@@ -1588,6 +1638,9 @@ static int a6xx_gmu_rpmh_votes_init(struct a6xx_gmu *gmu)
 	/* Build the CX votes */
 	ret |= a6xx_gmu_rpmh_arc_votes_init(gmu->dev, gmu->cx_arc_votes,
 		gmu->gmu_freqs, gmu->nr_gmu_freqs, "cx.lvl");
+
+	if (!ret && adreno_is_a730(adreno_gpu))
+		ret = a6xx_gmu_gx_cx_votes_init(&gpu->pdev->dev, gmu);
 
 	/* Build the interconnect votes */
 	if (info->bcms && gmu->nr_gpu_bws > 1)

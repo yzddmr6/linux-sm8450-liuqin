@@ -93,6 +93,8 @@ struct a6xx_gmu {
 	int nr_gpu_freqs;
 	unsigned long gpu_freqs[GMU_MAX_GX_FREQS];
 	u32 gx_arc_votes[GMU_MAX_GX_FREQS];
+	u32 gx_cx_votes[GMU_MAX_GX_FREQS];
+	bool has_gx_cx_votes;
 	struct a6xx_hfi_acd_table acd_table;
 
 	int nr_gpu_bws;

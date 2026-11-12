@@ -682,6 +682,61 @@
 	status = "okay";
 };
 
+/* The stock Adreno730v3 HFI table carries a CX dependency at every GX OPP.
+ * Each retained frequency uses the corner of the covering factory OPP.
+ */
+&gpu_opp_table {
+	compatible = "operating-points-v2-adreno", "operating-points-v2";
+
+	opp-220000000 {
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_LOW_SVS>;
+	};
+
+	opp-285000000 {
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_LOW_SVS>;
+	};
+
+	opp-317000000 {
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_LOW_SVS>;
+	};
+
+	opp-350000000 {
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_SVS>;
+	};
+
+	opp-421000000 {
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_SVS>;
+	};
+
+	opp-492000000 {
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_SVS>;
+	};
+
+	opp-545000000 {
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_SVS_L1>;
+	};
+
+	opp-599000000 {
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_SVS_L1>;
+	};
+
+	opp-640000000 {
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_SVS_L1>;
+	};
+
+	opp-734000000 {
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_NOM>;
+	};
+
+	opp-791000000 {
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_NOM_L1>;
+	};
+
+	opp-818000000 {
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_TURBO>;
+	};
+};
+
 &gpu {
 	status = "okay";
 
