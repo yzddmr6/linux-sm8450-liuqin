@@ -14,6 +14,7 @@
 #include <linux/mutex.h>
 #include <linux/of_device.h>
 #include <linux/power_supply.h>
+#include <linux/pm.h>
 #include <linux/property.h>
 #include <linux/soc/qcom/pdr.h>
 #include <linux/soc/qcom/pmic_glink.h>
@@ -91,6 +92,9 @@ enum qcom_battmgr_variant {
 
 #define BATTMGR_XM_PROPERTY_GET		0x50
 #define BATTMGR_XM_PROPERTY_SET		0x51
+#define XM_THERMAL_TEMP		86
+#define SM8475_REFRESH_INTERVAL	(10 * HZ)
+
 #define XM_CONNECTOR_TEMP		2
 #define XM_AUTHENTIC			3
 #define XM_REAL_TYPE			6
@@ -425,6 +429,7 @@ struct qcom_battmgr {
 	int liuqin_level_generation;
 
 	struct work_struct enable_work;
+	struct delayed_work refresh_work;
 	struct iio_channel *connector; /* acquired by connector_work */
 	bool connector_enabled;
 	struct delayed_work connector_work;
@@ -2466,9 +2471,46 @@ static void qcom_battmgr_stop_workers(void *data)
 	disable_work_sync(&b->online_work);
 	disable_work_sync(&b->enable_work);
 	disable_delayed_work_sync(&b->connector_work);
+	/* Cancel the refresher before devres releases its GLINK client. */
+	disable_delayed_work_sync(&b->refresh_work);
 	if (IS_REACHABLE(CONFIG_IIO) && b->connector)
 		iio_channel_release(b->connector);
 }
+
+/*
+ * M81 firmware refreshes its fuel-gauge snapshot when XM_THERMAL_TEMP is
+ * read. Ordinary BATT_* reads alone leave SOC, charge counter and temperature
+ * stale. The stock M81 driver issues this request every 10/20 seconds.
+ * Firmware subsequently reports the refreshed snapshot with notification 0x80.
+ */
+static void qcom_battmgr_sm8475_refresh_worker(struct work_struct *work)
+{
+	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
+						struct qcom_battmgr, refresh_work);
+	u32 temperature;
+	int ret;
+
+	if (READ_ONCE(battmgr->service_up)) {
+		ret = qcom_battmgr_xm_get(battmgr, XM_THERMAL_TEMP, &temperature);
+		if (ret)
+			dev_dbg(battmgr->dev, "fuel-gauge refresh failed: %d\n", ret);
+	}
+
+	queue_delayed_work(system_freezable_wq, &battmgr->refresh_work,
+			   SM8475_REFRESH_INTERVAL);
+}
+
+static int qcom_battmgr_resume(struct device *dev)
+{
+	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+
+	if (battmgr->variant == QCOM_BATTMGR_SM8475)
+		mod_delayed_work(system_freezable_wq, &battmgr->refresh_work, 0);
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(qcom_battmgr_pm_ops, NULL, qcom_battmgr_resume);
 
 static void qcom_battmgr_enable_worker(struct work_struct *work)
 {
@@ -2557,6 +2599,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 		return ret;
 	INIT_WORK(&battmgr->online_work, qcom_battmgr_check_online);
 	INIT_WORK(&battmgr->enable_work, qcom_battmgr_enable_worker);
+	INIT_DELAYED_WORK(&battmgr->refresh_work, qcom_battmgr_sm8475_refresh_worker);
 	mutex_init(&battmgr->lock);
 	init_completion(&battmgr->ack);
 	battmgr->liuqin_thermal_level = -1;
@@ -2637,7 +2680,11 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 		ret = devm_device_add_group(dev, &qcom_battmgr_raw_group);
 		if (ret)
 			return ret;
-		return devm_device_add_group(dev, &qcom_battmgr_xiaomi_group);
+		ret = devm_device_add_group(dev, &qcom_battmgr_xiaomi_group);
+		if (ret)
+			return ret;
+
+		queue_delayed_work(system_freezable_wq, &battmgr->refresh_work, 0);
 	}
 
 	return 0;
@@ -2653,6 +2700,7 @@ static struct auxiliary_driver qcom_battmgr_driver = {
 	.name = "pmic_glink_power_supply",
 	.probe = qcom_battmgr_probe,
 	.id_table = qcom_battmgr_id_table,
+	.driver.pm = pm_sleep_ptr(&qcom_battmgr_pm_ops),
 };
 
 module_auxiliary_driver(qcom_battmgr_driver);
