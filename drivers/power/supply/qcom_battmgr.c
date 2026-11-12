@@ -411,6 +411,10 @@ struct qcom_battmgr {
 	struct qcom_battmgr_xm_pending xm;
 	/* verify_slave_flag: selects the slave fuel gauge for verify_digest. */
 	bool xm_slave_fg;
+	/* Last acknowledged liuqin cooling level. Invalid after a service restart. */
+	int liuqin_thermal_level;
+	atomic_t service_generation;
+	int liuqin_level_generation;
 
 	struct work_struct enable_work;
 
@@ -434,7 +438,9 @@ static int qcom_battmgr_xm_transact_locked(struct qcom_battmgr *battmgr,
 	int ret;
 
 	if (opcode != BATTMGR_XM_PROPERTY_GET &&
-	    opcode != BATTMGR_XM_PROPERTY_SET)
+	    opcode != BATTMGR_XM_PROPERTY_SET &&
+	    !(opcode == BATTMGR_BAT_PROPERTY_SET && property == BATT_CHG_CTRL_LIM &&
+	      kind == QCOM_BATTMGR_XM_VALUE_RESPONSE))
 		return -EINVAL;
 
 	/* The callback may run before pmic_glink_send() returns. */
@@ -1022,7 +1028,57 @@ static ssize_t current_state_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(current_state);
 
+/*
+ * The M81 battery firmware accepts a cooling level from 0 through 15. This
+ * property is an index, not a current in microamps. Report only an acknowledged
+ * request and discard it when the charger service goes offline.
+ */
+static ssize_t thermal_level_requested_show(struct device *dev,
+					    struct device_attribute *attr, char *buf)
+{
+	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+	int level = READ_ONCE(battmgr->liuqin_thermal_level);
+
+	if (!READ_ONCE(battmgr->service_up) || level < 0 ||
+	    READ_ONCE(battmgr->liuqin_level_generation) != atomic_read(&battmgr->service_generation))
+		return -ENODATA;
+	return sysfs_emit(buf, "%d\n", level);
+}
+
+static ssize_t thermal_level_requested_store(struct device *dev,
+					     struct device_attribute *attr,
+					     const char *buf, size_t count)
+{
+	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+	unsigned int level;
+	int generation, ret;
+
+	if (kstrtouint(buf, 10, &level) || level > 15)
+		return -EINVAL;
+
+	mutex_lock(&battmgr->lock);
+	generation = atomic_read(&battmgr->service_generation);
+	if (!READ_ONCE(battmgr->service_up))
+		ret = -EAGAIN;
+	else
+		ret = qcom_battmgr_xm_request_locked(battmgr, BATTMGR_BAT_PROPERTY_SET,
+						     BATT_CHG_CTRL_LIM, level, NULL,
+						     QCOM_BATTMGR_XM_VALUE_RESPONSE,
+						     NULL, NULL);
+	if (!ret && generation != atomic_read(&battmgr->service_generation))
+		ret = -EAGAIN;
+	if (!ret) {
+		WRITE_ONCE(battmgr->liuqin_thermal_level, level);
+		WRITE_ONCE(battmgr->liuqin_level_generation, generation);
+	}
+	mutex_unlock(&battmgr->lock);
+
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(thermal_level_requested);
+
 static struct attribute *qcom_battmgr_xiaomi_attrs[] = {
+	&dev_attr_thermal_level_requested.attr,
 	&dev_attr_request_vdm_cmd.attr,
 	&dev_attr_verify_slave_flag.attr,
 	&dev_attr_verify_digest.attr,
@@ -1044,7 +1100,17 @@ static struct attribute *qcom_battmgr_xiaomi_attrs[] = {
 	NULL,
 };
 
+static umode_t qcom_battmgr_xiaomi_attr_visible(struct kobject *kobj,
+					       struct attribute *attr, int index)
+{
+	if (attr == &dev_attr_thermal_level_requested.attr &&
+	    !of_machine_is_compatible("xiaomi,liuqin"))
+		return 0;
+	return attr->mode;
+}
+
 static const struct attribute_group qcom_battmgr_xiaomi_group = {
+	.is_visible = qcom_battmgr_xiaomi_attr_visible,
 	.name = "xiaomi",
 	.attrs = qcom_battmgr_xiaomi_attrs,
 };
@@ -2170,7 +2236,9 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
 	}
 
 	/* XM must never reach the generic, broad completion path. */
-	if (opcode == BATTMGR_XM_PROPERTY_GET || opcode == BATTMGR_XM_PROPERTY_SET) {
+	if (opcode == BATTMGR_XM_PROPERTY_GET || opcode == BATTMGR_XM_PROPERTY_SET ||
+	    (battmgr->variant == QCOM_BATTMGR_SM8475 &&
+	     opcode == BATTMGR_BAT_PROPERTY_SET)) {
 		dev_warn_ratelimited(battmgr->dev,
 				     "unsolicited XM response %#x ignored\n", opcode);
 		return;
@@ -2204,10 +2272,12 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
 	struct qcom_battmgr *battmgr = priv;
 
 	if (state == SERVREG_SERVICE_STATE_UP) {
-		battmgr->service_up = true;
+		WRITE_ONCE(battmgr->service_up, true);
 		schedule_work(&battmgr->enable_work);
 	} else {
-		battmgr->service_up = false;
+		WRITE_ONCE(battmgr->service_up, false);
+		atomic_inc(&battmgr->service_generation);
+		WRITE_ONCE(battmgr->liuqin_thermal_level, -1);
 	}
 }
 
@@ -2258,6 +2328,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	INIT_WORK(&battmgr->enable_work, qcom_battmgr_enable_worker);
 	mutex_init(&battmgr->lock);
 	init_completion(&battmgr->ack);
+	battmgr->liuqin_thermal_level = -1;
 
 	match = of_match_device(qcom_battmgr_of_variants, dev->parent);
 	if (match)
