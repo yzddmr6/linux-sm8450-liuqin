@@ -55,6 +55,9 @@
 #define SWRM_INTERRUPT_STATUS_DOUT_PORT_COLLISION		BIT(8)
 #define SWRM_INTERRUPT_STATUS_READ_EN_RD_VALID_MISMATCH		BIT(9)
 #define SWRM_INTERRUPT_STATUS_SPECIAL_CMD_ID_FINISHED		BIT(10)
+#define SWRM_V1_7_INTERRUPT_STATUS_RD_FIFO_OVERFLOW		BIT(18)
+#define SWRM_V1_7_INTERRUPT_STATUS_RD_FIFO_UNDERFLOW		BIT(19)
+#define SWRM_V1_7_INTERRUPT_STATUS_SPECIAL_CMD_ID_FINISHED		BIT(20)
 #define SWRM_INTERRUPT_STATUS_AUTO_ENUM_FAILED			BIT(11)
 #define SWRM_INTERRUPT_STATUS_AUTO_ENUM_TABLE_IS_FULL		BIT(12)
 #define SWRM_INTERRUPT_STATUS_BUS_RESET_FINISHED_V2		BIT(13)
@@ -68,12 +71,15 @@
 #define SWRM_V1_3_INTERRUPT_CPU_EN				0x210
 #define SWRM_V2_0_INTERRUPT_CPU_EN				0x5004
 #define SWRM_V1_3_CMD_FIFO_WR_CMD				0x300
+#define SWRM_V1_7_CMD_FIFO_WR_CMD				0x31C
 #define SWRM_V2_0_CMD_FIFO_WR_CMD				0x5020
 #define SWRM_V1_3_CMD_FIFO_RD_CMD				0x304
+#define SWRM_V1_7_CMD_FIFO_RD_CMD				0x320
 #define SWRM_V2_0_CMD_FIFO_RD_CMD				0x5024
 #define SWRM_CMD_FIFO_CMD					0x308
 #define SWRM_CMD_FIFO_FLUSH					0x1
 #define SWRM_V1_3_CMD_FIFO_STATUS				0x30C
+#define SWRM_V1_7_CMD_FIFO_STATUS				0x328
 #define SWRM_V2_0_CMD_FIFO_STATUS				0x5050
 #define SWRM_RD_CMD_FIFO_CNT_MASK				GENMASK(20, 16)
 #define SWRM_WR_CMD_FIFO_CNT_MASK				GENMASK(12, 8)
@@ -81,6 +87,7 @@
 #define SWRM_CONTINUE_EXEC_ON_CMD_IGNORE			BIT(31)
 #define SWRM_RD_WR_CMD_RETRIES					0x7
 #define SWRM_V1_3_CMD_FIFO_RD_FIFO_ADDR				0x318
+#define SWRM_V1_7_CMD_FIFO_RD_FIFO_ADDR				0x334
 #define SWRM_V2_0_CMD_FIFO_RD_FIFO_ADDR				0x5040
 #define SWRM_RD_FIFO_CMD_ID_MASK				GENMASK(11, 8)
 #define SWRM_ENUMERATOR_CFG_ADDR				0x500
@@ -253,6 +260,21 @@ static const struct qcom_swrm_data swrm_v1_6_data = {
 	.sw_clk_gate_required = true,
 	.max_reg = SWR_V1_3_MSTR_MAX_REG_ADDR,
 	.reg_layout = swrm_v1_3_reg_layout,
+};
+
+
+
+/* v1.7 assigns the link manager and command FIFO to CPU1. */
+static const unsigned int swrm_v1_7_reg_layout[] = {
+	[SWRM_REG_FRAME_GEN_ENABLED] = SWRM_COMP_STATUS,
+	[SWRM_REG_INTERRUPT_STATUS] = SWRM_V1_3_INTERRUPT_STATUS,
+	[SWRM_REG_INTERRUPT_MASK_ADDR] = SWRM_V1_3_INTERRUPT_CPU_EN,
+	[SWRM_REG_INTERRUPT_CLEAR] = SWRM_V1_3_INTERRUPT_CLEAR,
+	[SWRM_REG_INTERRUPT_CPU_EN] = SWRM_V1_3_INTERRUPT_CPU_EN,
+	[SWRM_REG_CMD_FIFO_WR_CMD] = SWRM_V1_7_CMD_FIFO_WR_CMD,
+	[SWRM_REG_CMD_FIFO_RD_CMD] = SWRM_V1_7_CMD_FIFO_RD_CMD,
+	[SWRM_REG_CMD_FIFO_STATUS] = SWRM_V1_7_CMD_FIFO_STATUS,
+	[SWRM_REG_CMD_FIFO_RD_FIFO_ADDR] = SWRM_V1_7_CMD_FIFO_RD_FIFO_ADDR,
 };
 
 static const unsigned int swrm_v2_0_reg_layout[] = {
@@ -662,6 +684,46 @@ static irqreturn_t qcom_swrm_wake_irq_handler(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
+/* Keep dispatch bits common while acknowledging the original hardware status. */
+static u32 qcom_swrm_irq_status(struct qcom_swrm_ctrl *ctrl, u32 status)
+{
+	u32 cpu1;
+
+	if (ctrl->version != SWRM_VERSION_1_7_0)
+		return status;
+
+	cpu1 = status & (SWRM_V1_7_INTERRUPT_STATUS_RD_FIFO_OVERFLOW |
+			 SWRM_V1_7_INTERRUPT_STATUS_RD_FIFO_UNDERFLOW |
+			 SWRM_V1_7_INTERRUPT_STATUS_SPECIAL_CMD_ID_FINISHED);
+	status &= ~(SWRM_V1_7_INTERRUPT_STATUS_RD_FIFO_OVERFLOW |
+		    SWRM_V1_7_INTERRUPT_STATUS_RD_FIFO_UNDERFLOW |
+		    SWRM_V1_7_INTERRUPT_STATUS_SPECIAL_CMD_ID_FINISHED);
+	if (cpu1 & SWRM_V1_7_INTERRUPT_STATUS_RD_FIFO_OVERFLOW)
+		status |= SWRM_INTERRUPT_STATUS_RD_FIFO_OVERFLOW;
+	if (cpu1 & SWRM_V1_7_INTERRUPT_STATUS_RD_FIFO_UNDERFLOW)
+		status |= SWRM_INTERRUPT_STATUS_RD_FIFO_UNDERFLOW;
+	if (cpu1 & SWRM_V1_7_INTERRUPT_STATUS_SPECIAL_CMD_ID_FINISHED)
+		status |= SWRM_INTERRUPT_STATUS_SPECIAL_CMD_ID_FINISHED;
+
+	return status;
+}
+
+static u32 qcom_swrm_irq_mask(struct qcom_swrm_ctrl *ctrl)
+{
+	u32 mask = SWRM_INTERRUPT_STATUS_RMSK;
+
+	if (ctrl->version == SWRM_VERSION_1_7_0) {
+		mask &= ~(SWRM_INTERRUPT_STATUS_RD_FIFO_OVERFLOW |
+			  SWRM_INTERRUPT_STATUS_RD_FIFO_UNDERFLOW |
+			  SWRM_INTERRUPT_STATUS_SPECIAL_CMD_ID_FINISHED);
+		mask |= SWRM_V1_7_INTERRUPT_STATUS_RD_FIFO_OVERFLOW |
+			SWRM_V1_7_INTERRUPT_STATUS_RD_FIFO_UNDERFLOW |
+			SWRM_V1_7_INTERRUPT_STATUS_SPECIAL_CMD_ID_FINISHED;
+	}
+
+	return mask;
+}
+
 static irqreturn_t qcom_swrm_irq_handler(int irq, void *dev_id)
 {
 	struct qcom_swrm_ctrl *ctrl = dev_id;
@@ -673,7 +735,7 @@ static irqreturn_t qcom_swrm_irq_handler(int irq, void *dev_id)
 
 	ctrl->reg_read(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_STATUS],
 		       &intr_sts);
-	intr_sts_masked = intr_sts & ctrl->intr_mask;
+	intr_sts_masked = qcom_swrm_irq_status(ctrl, intr_sts & ctrl->intr_mask);
 
 	do {
 		for (i = 0; i < SWRM_INTERRUPT_MAX; i++) {
@@ -799,7 +861,7 @@ static irqreturn_t qcom_swrm_irq_handler(int irq, void *dev_id)
 				intr_sts);
 		ctrl->reg_read(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_STATUS],
 			       &intr_sts);
-		intr_sts_masked = intr_sts & ctrl->intr_mask;
+		intr_sts_masked = qcom_swrm_irq_status(ctrl, intr_sts & ctrl->intr_mask);
 	} while (intr_sts_masked);
 
 	clk_disable_unprepare(ctrl->hclk);
@@ -841,11 +903,11 @@ static int qcom_swrm_init(struct qcom_swrm_ctrl *ctrl)
 	/* Enable Auto enumeration */
 	ctrl->reg_write(ctrl, SWRM_ENUMERATOR_CFG_ADDR, 1);
 
-	ctrl->intr_mask = SWRM_INTERRUPT_STATUS_RMSK;
+	ctrl->intr_mask = qcom_swrm_irq_mask(ctrl);
 	/* Mask soundwire interrupts */
 	if (ctrl->version < SWRM_VERSION_2_0_0)
 		ctrl->reg_write(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_MASK_ADDR],
-				SWRM_INTERRUPT_STATUS_RMSK);
+				ctrl->intr_mask);
 
 	/* Configure No pings */
 	ctrl->reg_read(ctrl, SWRM_MCP_CFG_ADDR, &val);
@@ -887,7 +949,7 @@ static int qcom_swrm_init(struct qcom_swrm_ctrl *ctrl)
 	/* enable CPU IRQs */
 	if (ctrl->mmio) {
 		ctrl->reg_write(ctrl, ctrl->reg_layout[SWRM_REG_INTERRUPT_CPU_EN],
-				SWRM_INTERRUPT_STATUS_RMSK);
+				ctrl->intr_mask);
 	}
 
 	/* Set IRQ to PULSE */
@@ -1578,6 +1640,8 @@ static int qcom_swrm_probe(struct platform_device *pdev)
 	prop->default_row = data->default_rows;
 
 	ctrl->reg_read(ctrl, SWRM_COMP_HW_VERSION, &ctrl->version);
+	if (ctrl->version == SWRM_VERSION_1_7_0)
+		ctrl->reg_layout = swrm_v1_7_reg_layout;
 
 	ret = devm_request_threaded_irq(dev, ctrl->irq, NULL,
 					qcom_swrm_irq_handler,
