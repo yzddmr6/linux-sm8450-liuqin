@@ -689,6 +689,7 @@
 	compatible = "operating-points-v2-adreno", "operating-points-v2";
 
 	opp-220000000 {
+		opp-level = <RPMH_REGULATOR_LEVEL_MIN_SVS>;
 		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_LOW_SVS>;
 	};
 
@@ -701,10 +702,12 @@
 	};
 
 	opp-350000000 {
+		opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_L1>;
 		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_SVS>;
 	};
 
 	opp-421000000 {
+		opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_L2>;
 		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_SVS>;
 	};
 
@@ -721,6 +724,7 @@
 	};
 
 	opp-640000000 {
+		opp-level = <RPMH_REGULATOR_LEVEL_SVS_L1>;
 		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_SVS_L1>;
 	};
 
@@ -917,6 +921,9 @@
  * protection firmware block exceeds mainline's one-second timeout at 100 kHz.
  */
 &i2c15 {
+	/* Fixed 19.2 MHz source used by the 400 kHz I2C timing table. */
+	power-domains = <&rpmhpd RPMHPD_CX>, <&rpmhpd RPMHPD_MX>;
+	required-opps = <&rpmhpd_opp_low_svs>, <&rpmhpd_opp_low_svs>;
 	clock-frequency = <400000>;
 	status = "okay";
 
@@ -968,6 +975,9 @@
 };
 
 &i2c17 {
+	/* Fixed 19.2 MHz source used by the 400 kHz I2C timing table. */
+	power-domains = <&rpmhpd RPMHPD_CX>, <&rpmhpd RPMHPD_MX>;
+	required-opps = <&rpmhpd_opp_low_svs>, <&rpmhpd_opp_low_svs>;
 	clock-frequency = <400000>;
 	status = "okay";
 
@@ -1178,6 +1188,29 @@
  */
 &mdss {
 	status = "okay";
+};
+
+/* Cape DISP_CC_MDP_CLK_SRC votes both vdd_mm and vdd_mxa. */
+&mdss_mdp {
+	power-domains = <&rpmhpd RPMHPD_MMCX>, <&rpmhpd RPMHPD_MX>;
+};
+
+&mdp_opp_table {
+	opp-172000000 {
+		required-opps = <&rpmhpd_opp_low_svs_d1>, <&rpmhpd_opp_low_svs_d1>;
+	};
+	opp-200000000 {
+		required-opps = <&rpmhpd_opp_low_svs>, <&rpmhpd_opp_low_svs>;
+	};
+	opp-325000000 {
+		required-opps = <&rpmhpd_opp_svs>, <&rpmhpd_opp_svs>;
+	};
+	opp-375000000 {
+		required-opps = <&rpmhpd_opp_svs_l1>, <&rpmhpd_opp_svs_l1>;
+	};
+	opp-500000000 {
+		required-opps = <&rpmhpd_opp_nom>, <&rpmhpd_opp_nom>;
+	};
 };
 
 &mdss_dsi0 {

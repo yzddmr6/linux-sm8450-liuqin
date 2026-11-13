@@ -13,6 +13,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/soc/qcom/geni-se.h>
 #include <linux/spinlock.h>
@@ -788,6 +789,16 @@ static int geni_i2c_probe(struct platform_device *pdev)
 	gi2c = devm_kzalloc(dev, sizeof(*gi2c), GFP_KERNEL);
 	if (!gi2c)
 		return -ENOMEM;
+
+	/* Attach both SE clock supplies when the platform describes them. */
+	if (of_count_phandle_with_args(dev->of_node, "power-domains",
+				       "#power-domain-cells") > 1) {
+		struct dev_pm_domain_list *domains;
+
+		ret = devm_pm_domain_attach_list(dev, NULL, &domains);
+		if (ret < 0)
+			return dev_err_probe(dev, ret, "failed to attach SE domains\n");
+	}
 
 	gi2c->se.dev = dev;
 	gi2c->se.wrapper = dev_get_drvdata(dev->parent);

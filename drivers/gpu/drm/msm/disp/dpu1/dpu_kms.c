@@ -12,6 +12,7 @@
 #include <linux/debugfs.h>
 #include <linux/dma-buf.h>
 #include <linux/of_irq.h>
+#include <linux/pm_domain.h>
 #include <linux/pm_opp.h>
 
 #include <drm/drm_crtc.h>
@@ -1414,6 +1415,19 @@ static int dpu_dev_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	dpu_kms->pdev = pdev;
+
+	/* Some display clocks require performance votes on two independent rails. */
+	if (of_count_phandle_with_args(dev->of_node, "power-domains",
+				       "#power-domain-cells") > 1) {
+		struct dev_pm_domain_attach_data data = {
+			.pd_flags = PD_FLAG_REQUIRED_OPP,
+		};
+		struct dev_pm_domain_list *domains;
+
+		ret = devm_pm_domain_attach_list(dev, &data, &domains);
+		if (ret < 0)
+			return dev_err_probe(dev, ret, "failed to attach OPP domains\n");
+	}
 
 	ret = devm_pm_opp_set_clkname(dev, "core");
 	if (ret)
