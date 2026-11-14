@@ -8,6 +8,7 @@
 #include <linux/auxiliary_bus.h>
 #include <linux/ctype.h>
 #include <linux/hex.h>
+#include <linux/iio/consumer.h>
 #include <linux/swab.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -90,6 +91,7 @@ enum qcom_battmgr_variant {
 
 #define BATTMGR_XM_PROPERTY_GET		0x50
 #define BATTMGR_XM_PROPERTY_SET		0x51
+#define XM_CONNECTOR_TEMP		2
 #define XM_AUTHENTIC			3
 #define XM_REAL_TYPE			6
 #define XM_VERIFY_PROCESS		7
@@ -418,6 +420,9 @@ struct qcom_battmgr {
 	int liuqin_level_generation;
 
 	struct work_struct enable_work;
+	struct iio_channel *connector;
+	struct delayed_work connector_work;
+	ktime_t connector_test_until;
 
 	/*
 	 * @lock is used to prevent concurrent power supply requests to the
@@ -530,12 +535,14 @@ static int qcom_battmgr_xm_get_words_locked(struct qcom_battmgr *battmgr,
 /*
  * SET is restricted to the properties the vendor authentication daemon
  * (batterysecret) writes: battery/adapter authentication verdicts, the
- * verification-in-progress flag and the UVDM command channel.  There is no
+ * verification-in-progress flag and the UVDM command channel.  There is a
+ * separate connector thermistor update for firmware thermal policy. No
  * arbitrary XM-property write path and no current, voltage or PMIC write.
  */
 static bool qcom_battmgr_xm_set_allowed(u32 property)
 {
 	switch (property) {
+	case XM_CONNECTOR_TEMP:
 	case XM_AUTHENTIC:
 	case XM_SLAVE_AUTHENTIC:
 	case XM_VERIFY_PROCESS:
@@ -714,6 +721,7 @@ static ssize_t _name##_show(struct device *dev, \
 static DEVICE_ATTR_RO(_name)
 
 QCOM_BATTMGR_RAW_ATTR(raw_usb_real_type, BATTMGR_USB_PROPERTY_GET, USB_REAL_TYPE);
+QCOM_BATTMGR_RAW_ATTR(raw_xm_connector_temp, BATTMGR_XM_PROPERTY_GET, XM_CONNECTOR_TEMP);
 QCOM_BATTMGR_RAW_ATTR(raw_xm_authentic, BATTMGR_XM_PROPERTY_GET, XM_AUTHENTIC);
 QCOM_BATTMGR_RAW_ATTR(raw_xm_real_type, BATTMGR_XM_PROPERTY_GET, XM_REAL_TYPE);
 QCOM_BATTMGR_RAW_ATTR(raw_xm_verify_process, BATTMGR_XM_PROPERTY_GET, XM_VERIFY_PROCESS);
@@ -729,6 +737,7 @@ QCOM_BATTMGR_RAW_ATTR(raw_xm_power_max, BATTMGR_XM_PROPERTY_GET, XM_POWER_MAX);
 
 static struct attribute *qcom_battmgr_raw_attrs[] = {
 	&dev_attr_raw_usb_real_type.attr,
+	&dev_attr_raw_xm_connector_temp.attr,
 	&dev_attr_raw_xm_authentic.attr,
 	&dev_attr_raw_xm_real_type.attr,
 	&dev_attr_raw_xm_verify_process.attr,
@@ -2260,11 +2269,62 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
 		qcom_battmgr_sm8350_callback(battmgr, data, len);
 }
 
+/* The active mi_thermald connector monitor sleeps 1000000 us between samples. */
+static void qcom_battmgr_connector_worker(struct work_struct *work)
+{
+	struct qcom_battmgr *b = container_of(to_delayed_work(work),
+					      struct qcom_battmgr, connector_work);
+	int temp, ret;
+
+	if (!IS_REACHABLE(CONFIG_IIO) || !READ_ONCE(b->service_up))
+		return;
+
+	ret = iio_read_channel_processed(b->connector, &temp);
+	if (!ret) {
+		temp = DIV_ROUND_CLOSEST(temp, 100);
+		mutex_lock(&b->lock);
+		if (ktime_before(ktime_get_boottime(), b->connector_test_until))
+			temp = max(temp, 750);
+		ret = qcom_battmgr_xm_set_value_locked(b, XM_CONNECTOR_TEMP, temp);
+		mutex_unlock(&b->lock);
+	}
+	if (ret)
+		dev_warn_ratelimited(b->dev, "connector temperature update failed: %d\n", ret);
+	queue_delayed_work(system_freezable_wq, &b->connector_work, msecs_to_jiffies(1000));
+}
+
+static ssize_t connector_hot_test_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct qcom_battmgr *b = dev_get_drvdata(dev);
+	bool enable;
+
+	if (kstrtobool(buf, &enable))
+		return -EINVAL;
+	mutex_lock(&b->lock);
+	b->connector_test_until = enable ? ktime_add_ms(ktime_get_boottime(), 10000) : 0;
+	mutex_unlock(&b->lock);
+	mod_delayed_work(system_freezable_wq, &b->connector_work, 0);
+	return count;
+}
+static DEVICE_ATTR_WO(connector_hot_test);
+
+static struct attribute *connector_test_attrs[] = {
+	&dev_attr_connector_hot_test.attr,
+	NULL
+};
+static const struct attribute_group connector_test_group = {
+	.attrs = connector_test_attrs,
+};
+
 static void qcom_battmgr_stop_workers(void *data)
 {
 	struct qcom_battmgr *b = data;
 
 	disable_work_sync(&b->enable_work);
+	if (b->connector)
+		disable_delayed_work_sync(&b->connector_work);
 }
 
 static void qcom_battmgr_enable_worker(struct work_struct *work)
@@ -2280,6 +2340,8 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
 	mutex_lock(&battmgr->lock);
 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
 	mutex_unlock(&battmgr->lock);
+	if (battmgr->connector)
+		mod_delayed_work(system_freezable_wq, &battmgr->connector_work, 0);
 	if (ret)
 		dev_err(battmgr->dev, "failed to request power notifications\n");
 }
@@ -2391,6 +2453,17 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 					     "failed to register wireless charing power supply\n");
 	}
 
+	if (battmgr->variant == QCOM_BATTMGR_SM8475 &&
+	    device_property_match_string(dev, "io-channel-names", "connector-temp") >= 0) {
+		if (!IS_REACHABLE(CONFIG_IIO))
+			return -ENODEV;
+		battmgr->connector = devm_iio_channel_get(dev, "connector-temp");
+		if (IS_ERR(battmgr->connector))
+			return dev_err_probe(dev, PTR_ERR(battmgr->connector),
+					     "connector thermistor unavailable\n");
+		INIT_DELAYED_WORK(&battmgr->connector_work, qcom_battmgr_connector_worker);
+	}
+
 	battmgr->client = devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_BATTMGR,
 						       qcom_battmgr_callback,
 						       qcom_battmgr_pdr_notify,
@@ -2401,6 +2474,12 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	ret = devm_add_action_or_reset(dev, qcom_battmgr_stop_workers, battmgr);
 	if (ret)
 		return ret;
+
+	if (battmgr->connector) {
+		ret = devm_device_add_group(dev, &connector_test_group);
+		if (ret)
+			return ret;
+	}
 
 	pmic_glink_client_register(battmgr->client);
 
