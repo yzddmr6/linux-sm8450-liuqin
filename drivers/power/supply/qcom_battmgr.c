@@ -20,6 +20,7 @@
 #include <linux/soc/qcom/pmic_glink.h>
 #include <linux/math.h>
 #include <linux/units.h>
+#include <linux/overflow.h>
 
 #define BATTMGR_CHEMISTRY_LEN	4
 #define BATTMGR_STRING_LEN	128
@@ -1251,6 +1252,7 @@ static const u8 sm8350_bat_prop_map[] = {
 	[POWER_SUPPLY_PROP_CYCLE_COUNT] = BATT_CYCLE_COUNT,
 	[POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN] =  BATT_CHG_FULL_DESIGN,
 	[POWER_SUPPLY_PROP_CHARGE_FULL] = BATT_CHG_FULL,
+	[POWER_SUPPLY_PROP_CHARGE_NOW] = BATT_CHG_COUNTER,
 	[POWER_SUPPLY_PROP_MODEL_NAME] = BATT_MODEL_NAME,
 	[POWER_SUPPLY_PROP_TIME_TO_FULL_AVG] = BATT_TTF_AVG,
 	[POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG] = BATT_TTE_AVG,
@@ -1334,6 +1336,20 @@ out_unlock:
 	return ret;
 }
 
+static int qcom_battmgr_bat_charge_counter(struct qcom_battmgr *battmgr,
+					 union power_supply_propval *val)
+{
+	s32 counter = battmgr->info.charge_count;
+
+	/* Xiaomi reports the counter in mAh; full/design charge is already uAh. */
+	if (battmgr->variant == QCOM_BATTMGR_SM8475 &&
+	    check_mul_overflow(counter, MILLI, &counter))
+		return -ERANGE;
+
+	val->intval = counter;
+	return 0;
+}
+
 static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 					 enum power_supply_property psp,
 					 union power_supply_propval *val)
@@ -1344,6 +1360,17 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 
 	if (!battmgr->service_up)
 		return -EAGAIN;
+
+	if (battmgr->variant == QCOM_BATTMGR_SM8475) {
+		/* This property protocol has no BAT_INFO response to set the unit. */
+		unit = QCOM_BATTMGR_UNIT_mAh;
+
+		/* Keep firmware placeholders and unverified time units out of the ABI. */
+		if (psp == POWER_SUPPLY_PROP_POWER_NOW ||
+		    psp == POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG ||
+		    psp == POWER_SUPPLY_PROP_TIME_TO_FULL_AVG)
+			return -ENODATA;
+	}
 
 	if (battmgr->variant == QCOM_BATTMGR_SC8280XP)
 		ret = qcom_battmgr_bat_sc8280xp_update(battmgr, psp);
@@ -1410,11 +1437,12 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CHARGE_NOW:
 		if (unit != QCOM_BATTMGR_UNIT_mAh)
 			return -ENODATA;
+		if (battmgr->variant == QCOM_BATTMGR_SM8475)
+			return qcom_battmgr_bat_charge_counter(battmgr, val);
 		val->intval = battmgr->status.capacity;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
-		val->intval = battmgr->info.charge_count;
-		break;
+		return qcom_battmgr_bat_charge_counter(battmgr, val);
 	case POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN:
 		if (unit != QCOM_BATTMGR_UNIT_mWh)
 			return -ENODATA;
@@ -1535,6 +1563,39 @@ static const struct power_supply_desc sm8350_bat_psy_desc = {
 	.type = POWER_SUPPLY_TYPE_BATTERY,
 	.properties = sm8350_bat_props,
 	.num_properties = ARRAY_SIZE(sm8350_bat_props),
+	.get_property = qcom_battmgr_bat_get_property,
+};
+
+/*
+ * Xiaomi's POWER_NOW is a fixed placeholder and its time estimates are not
+ * in verified Linux ABI units. Export measured charge/current/voltage instead;
+ * userspace can derive energy, power and runtime estimates from those.
+ */
+static const enum power_supply_property sm8475_bat_props[] = {
+	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_HEALTH,
+	POWER_SUPPLY_PROP_PRESENT,
+	POWER_SUPPLY_PROP_CHARGE_TYPE,
+	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_VOLTAGE_OCV,
+	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_VOLTAGE_MAX,
+	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_TEMP,
+	POWER_SUPPLY_PROP_TECHNOLOGY,
+	POWER_SUPPLY_PROP_CHARGE_COUNTER,
+	POWER_SUPPLY_PROP_CYCLE_COUNT,
+	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
+	POWER_SUPPLY_PROP_CHARGE_FULL,
+	POWER_SUPPLY_PROP_CHARGE_NOW,
+	POWER_SUPPLY_PROP_MODEL_NAME,
+};
+
+static const struct power_supply_desc sm8475_bat_psy_desc = {
+	.name = "qcom-battmgr-bat",
+	.type = POWER_SUPPLY_TYPE_BATTERY,
+	.properties = sm8475_bat_props,
+	.num_properties = ARRAY_SIZE(sm8475_bat_props),
 	.get_property = qcom_battmgr_bat_get_property,
 };
 
@@ -2647,7 +2708,12 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 			return dev_err_probe(dev, PTR_ERR(battmgr->wls_psy),
 					     "failed to register wireless charing power supply\n");
 	} else {
-		battmgr->bat_psy = devm_power_supply_register(dev, &sm8350_bat_psy_desc, &psy_cfg);
+		const struct power_supply_desc *psy_desc = &sm8350_bat_psy_desc;
+
+		if (battmgr->variant == QCOM_BATTMGR_SM8475)
+			psy_desc = &sm8475_bat_psy_desc;
+
+		battmgr->bat_psy = devm_power_supply_register(dev, psy_desc, &psy_cfg);
 		if (IS_ERR(battmgr->bat_psy))
 			return dev_err_probe(dev, PTR_ERR(battmgr->bat_psy),
 					     "failed to register battery power supply\n");
