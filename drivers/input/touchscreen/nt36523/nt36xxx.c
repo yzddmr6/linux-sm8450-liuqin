@@ -28,6 +28,8 @@
 #include <linux/init.h>
 #include <linux/string.h>
 
+#include <drm/drm_vblank.h>
+
 #include "nt36xxx.h"
 
 #if NVT_TOUCH_ESD_PROTECT
@@ -909,7 +911,7 @@ static void nvt_esd_check_func(struct work_struct *work)
 		/*
 		 * A follower may only recover after the panel has re-established
 		 * ownership of the shared TDDI.  Stop input and wait for the next
-		 * unprepare/prepare cycle instead of downloading behind the panel.
+		 * disable/enable cycle instead of downloading behind the panel.
 		 */
 		if (ts->is_panel_follower) {
 			nvt_irq_enable(false);
@@ -1670,7 +1672,7 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 #endif /* #if NVT_TOUCH_ESD_PROTECT */
 
 	ts->event_wq = alloc_workqueue("nvt-event-queue",
-		WQ_UNBOUND | WQ_HIGHPRI | WQ_CPU_INTENSIVE, 1);
+		WQ_UNBOUND | WQ_HIGHPRI | WQ_CPU_INTENSIVE | WQ_FREEZABLE, 1);
 	if (!ts->event_wq) {
 		NVT_ERR("Can not create work thread for suspend/resume!!");
 		ret = -ENOMEM;
@@ -1696,16 +1698,12 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 
 	{
 		unsigned long flags;
-		bool queue_resume;
 
 		spin_lock_irqsave(&ts->lifecycle_lock, flags);
 		ts->resources_ready = true;
-		queue_resume = ts->is_panel_follower && ts->panel_on &&
-			       !ts->stopping;
-		spin_unlock_irqrestore(&ts->lifecycle_lock, flags);
-
-		if (queue_resume)
+		if (ts->is_panel_follower && ts->panel_on && !ts->stopping)
 			queue_work(ts->event_wq, &ts->resume_work);
+		spin_unlock_irqrestore(&ts->lifecycle_lock, flags);
 	}
 
 	if (!ts->is_panel_follower) {
@@ -1946,13 +1944,34 @@ static int32_t nvt_ts_suspend(struct device *dev)
 	return 0;
 }
 
-/*******************************************************
-Description:
-	Novatek touchscreen driver resume function.
+/*
+ * MSM enables the panel bridge before its first CTL flush. Wait off the
+ * commit path for the video timing engine rather than guessing a delay.
+ * panel_disabling drains this worker before the bridge releases the CRTC.
+ */
+static int nvt_wait_for_scanout(struct drm_panel *panel)
+{
+	struct drm_crtc *crtc = panel->active_crtc;
+	u64 seq;
+	long remaining;
+	int ret;
 
-return:
-	Executive outcomes. 0---succeed.
-*******************************************************/
+	if (!IS_ENABLED(CONFIG_DRM) || !crtc)
+		return -ENODEV;
+
+	ret = drm_crtc_vblank_get(crtc);
+	if (ret < 0)
+		return ret;
+
+	seq = drm_crtc_vblank_count(crtc);
+	remaining = wait_event_timeout(*drm_crtc_vblank_waitqueue(crtc),
+				    drm_crtc_vblank_count(crtc) != seq,
+				    msecs_to_jiffies(100));
+	drm_crtc_vblank_put(crtc);
+
+	return remaining ? 0 : -ETIMEDOUT;
+}
+
 static int32_t nvt_ts_resume(struct device *dev)
 {
 	bool hold_wake = ts->dev_pm_suspend;
@@ -1965,6 +1984,14 @@ static int32_t nvt_ts_resume(struct device *dev)
 	if (ts->is_panel_follower && !nvt_panel_resume_allowed(ts)) {
 		NVT_LOG("panel is not ready for touch resume\n");
 		return -EHOSTDOWN;
+	}
+
+	if (ts->is_panel_follower) {
+		ret = nvt_wait_for_scanout(ts->panel_follower.panel);
+		if (ret) {
+			NVT_ERR("no panel vblank for touch resume: %d\n", ret);
+			return ret;
+		}
 	}
 
 	/* Keep every failure path quiescent before taking the SPI mutex. */
@@ -2094,27 +2121,23 @@ static const struct dev_pm_ops nvt_dev_pm_ops = {
 	.resume = nvt_pm_resume,
 };
 
-static int panel_prepared(struct drm_panel_follower *follower)
+static int panel_enabled(struct drm_panel_follower *follower)
 {
 	struct nvt_ts_data *ts = container_of(follower, struct nvt_ts_data,
 					       panel_follower);
 	unsigned long flags;
-	bool queue_resume;
 
+	NVT_LOG("panel enabled\n");
 	spin_lock_irqsave(&ts->lifecycle_lock, flags);
 	ts->panel_on = true;
-	queue_resume = ts->resources_ready && !ts->stopping;
-	spin_unlock_irqrestore(&ts->lifecycle_lock, flags);
-
-	NVT_LOG("panel prepared\n");
-
-	if (queue_resume)
+	if (ts->resources_ready && !ts->stopping)
 		queue_work(ts->event_wq, &ts->resume_work);
+	spin_unlock_irqrestore(&ts->lifecycle_lock, flags);
 
 	return 0;
 }
 
-static int panel_unpreparing(struct drm_panel_follower *follower)
+static int panel_disabling(struct drm_panel_follower *follower)
 {
 	struct nvt_ts_data *ts = container_of(follower, struct nvt_ts_data,
 					       panel_follower);
@@ -2126,9 +2149,9 @@ static int panel_unpreparing(struct drm_panel_follower *follower)
 	resources_ready = ts->resources_ready;
 	spin_unlock_irqrestore(&ts->lifecycle_lock, flags);
 
-	NVT_LOG("panel unpreparing\n");
+	NVT_LOG("panel disabling\n");
 
-	/* The callback is the barrier before the panel's physical reset. */
+	/* Quiesce SPI and IRQ while the panel still supplies display timing. */
 	if (ts->event_wq)
 		cancel_work_sync(&ts->resume_work);
 
@@ -2138,8 +2161,8 @@ static int panel_unpreparing(struct drm_panel_follower *follower)
 }
 
 static struct drm_panel_follower_funcs nt36xxx_panel_follower_funcs = {
-	.panel_prepared = panel_prepared,
-	.panel_unpreparing = panel_unpreparing,
+	.panel_enabled = panel_enabled,
+	.panel_disabling = panel_disabling,
 };
 
 static const struct spi_device_id nvt_ts_id[] = {

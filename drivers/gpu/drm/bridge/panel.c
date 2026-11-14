@@ -145,6 +145,7 @@ static void panel_bridge_atomic_enable(struct drm_bridge *bridge,
 	if (old_crtc_state && old_crtc_state->self_refresh_active)
 		return;
 
+	panel_bridge->panel->active_crtc = crtc;
 	drm_panel_enable(panel_bridge->panel);
 }
 
@@ -165,6 +166,7 @@ static void panel_bridge_atomic_disable(struct drm_bridge *bridge,
 		return;
 
 	drm_panel_disable(panel_bridge->panel);
+	panel_bridge->panel->active_crtc = NULL;
 }
 
 static void panel_bridge_atomic_post_disable(struct drm_bridge *bridge,
