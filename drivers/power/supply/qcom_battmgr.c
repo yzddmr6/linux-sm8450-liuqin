@@ -2404,7 +2404,7 @@ static void qcom_battmgr_connector_worker(struct work_struct *work)
 			b->connector = chan;
 		}
 		ret = iio_read_channel_processed(b->connector, &temp);
-		if (ret)
+		if (ret < 0)
 			goto rearm;
 		temp = DIV_ROUND_CLOSEST(temp, 100);
 		b->connector_real_temp = temp;
@@ -2416,7 +2416,7 @@ static void qcom_battmgr_connector_worker(struct work_struct *work)
 	if (!ret)
 		WRITE_ONCE(b->connector_injected, temp != b->connector_real_temp);
 rearm:
-	if (ret && ret != -EPROBE_DEFER)
+	if (ret < 0 && ret != -EPROBE_DEFER)
 		dev_warn_ratelimited(b->dev, "connector temperature update failed: %d\n", ret);
 	scoped_guard(spinlock_irqsave, &b->connector_lock) {
 		if (b->connector_active)
