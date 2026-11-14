@@ -2260,6 +2260,13 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
 		qcom_battmgr_sm8350_callback(battmgr, data, len);
 }
 
+static void qcom_battmgr_stop_workers(void *data)
+{
+	struct qcom_battmgr *b = data;
+
+	disable_work_sync(&b->enable_work);
+}
+
 static void qcom_battmgr_enable_worker(struct work_struct *work)
 {
 	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr, enable_work);
@@ -2270,7 +2277,9 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
 	};
 	int ret;
 
+	mutex_lock(&battmgr->lock);
 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
+	mutex_unlock(&battmgr->lock);
 	if (ret)
 		dev_err(battmgr->dev, "failed to request power notifications\n");
 }
@@ -2308,6 +2317,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	const struct of_device_id *match;
 	struct qcom_battmgr *battmgr;
 	struct device *dev = &adev->dev;
+	int ret;
 
 	battmgr = devm_kzalloc(dev, sizeof(*battmgr), GFP_KERNEL);
 	if (!battmgr)
@@ -2388,11 +2398,13 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	if (IS_ERR(battmgr->client))
 		return PTR_ERR(battmgr->client);
 
+	ret = devm_add_action_or_reset(dev, qcom_battmgr_stop_workers, battmgr);
+	if (ret)
+		return ret;
+
 	pmic_glink_client_register(battmgr->client);
 
 	if (battmgr->variant == QCOM_BATTMGR_SM8475) {
-		int ret;
-
 		ret = devm_device_add_group(dev, &qcom_battmgr_raw_group);
 		if (ret)
 			return ret;
