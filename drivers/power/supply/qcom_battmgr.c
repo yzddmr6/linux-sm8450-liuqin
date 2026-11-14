@@ -428,6 +428,11 @@ struct qcom_battmgr {
 	struct iio_channel *connector;
 	struct delayed_work connector_work;
 	ktime_t connector_test_until;
+	spinlock_t connector_lock; /* serializes gate changes and periodic rearming */
+	bool connector_active;
+	bool connector_source;
+	bool connector_injected;
+	int connector_real_temp;
 
 	/*
 	 * @lock is used to prevent concurrent power supply requests to the
@@ -1817,6 +1822,33 @@ static void qcom_battmgr_queue_online(struct qcom_battmgr *b, int input)
 	schedule_work(&b->online_work);
 }
 
+/* Called by GLINK with client_lock held, including the initial role replay. */
+static void qcom_battmgr_connector_gate(struct qcom_battmgr *b)
+{
+	bool active = b->service_up && (b->online_mask || b->connector_source);
+
+	if (!b->connector)
+		return;
+
+	scoped_guard(spinlock, &b->connector_lock) {
+		if (active == b->connector_active)
+			return;
+		WRITE_ONCE(b->connector_active, active);
+		if (active || READ_ONCE(b->connector_injected))
+			mod_delayed_work(system_freezable_wq, &b->connector_work, 0);
+		else
+			cancel_delayed_work(&b->connector_work);
+	}
+}
+
+static void qcom_battmgr_source_changed(void *priv, unsigned long ports)
+{
+	struct qcom_battmgr *b = priv;
+
+	b->connector_source = ports & BIT(0);
+	qcom_battmgr_connector_gate(b);
+}
+
 /* GLINK serializes RX and service-down callbacks under client_lock. */
 static void qcom_battmgr_online_response(struct qcom_battmgr *b, u8 mask, u8 online)
 {
@@ -1825,6 +1857,7 @@ static void qcom_battmgr_online_response(struct qcom_battmgr *b, u8 mask, u8 onl
 		pm_wakeup_hard_event(b->dev);
 	b->online_mask = (b->online_mask & ~mask) | online;
 	b->online_valid |= mask;
+	qcom_battmgr_connector_gate(b);
 }
 
 static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
@@ -2343,18 +2376,35 @@ static void qcom_battmgr_connector_worker(struct work_struct *work)
 	if (!IS_REACHABLE(CONFIG_IIO) || !READ_ONCE(b->service_up))
 		return;
 
-	ret = iio_read_channel_processed(b->connector, &temp);
-	if (!ret) {
+	guard(mutex)(&b->lock);
+	if (!READ_ONCE(b->connector_active)) {
+		/* A fake hot sample may itself have caused the USB offline edge. */
+		if (!b->connector_injected)
+			return;
+		temp = b->connector_real_temp;
+		b->connector_test_until = 0;
+	} else {
+		ret = iio_read_channel_processed(b->connector, &temp);
+		if (ret)
+			goto rearm;
 		temp = DIV_ROUND_CLOSEST(temp, 100);
-		mutex_lock(&b->lock);
+		b->connector_real_temp = temp;
 		if (ktime_before(ktime_get_boottime(), b->connector_test_until))
 			temp = max(temp, 750);
-		ret = qcom_battmgr_xm_set_value_locked(b, XM_CONNECTOR_TEMP, temp);
-		mutex_unlock(&b->lock);
 	}
+
+	ret = qcom_battmgr_xm_set_value_locked(b, XM_CONNECTOR_TEMP, temp);
+	if (!ret)
+		WRITE_ONCE(b->connector_injected, temp != b->connector_real_temp);
+rearm:
 	if (ret)
 		dev_warn_ratelimited(b->dev, "connector temperature update failed: %d\n", ret);
-	queue_delayed_work(system_freezable_wq, &b->connector_work, msecs_to_jiffies(1000));
+	scoped_guard(spinlock_irqsave, &b->connector_lock) {
+		if (b->connector_active)
+			queue_delayed_work(system_freezable_wq, &b->connector_work, HZ);
+		else if (!ret && b->connector_injected)
+			queue_delayed_work(system_freezable_wq, &b->connector_work, 0);
+	}
 }
 
 static ssize_t connector_hot_test_store(struct device *dev,
@@ -2367,6 +2417,10 @@ static ssize_t connector_hot_test_store(struct device *dev,
 	if (kstrtobool(buf, &enable))
 		return -EINVAL;
 	mutex_lock(&b->lock);
+	if (enable && !READ_ONCE(b->connector_active)) {
+		mutex_unlock(&b->lock);
+		return -ENOTCONN;
+	}
 	b->connector_test_until = enable ? ktime_add_ms(ktime_get_boottime(), 10000) : 0;
 	mutex_unlock(&b->lock);
 	mod_delayed_work(system_freezable_wq, &b->connector_work, 0);
@@ -2405,8 +2459,6 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
 	mutex_lock(&battmgr->lock);
 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
 	mutex_unlock(&battmgr->lock);
-	if (battmgr->connector)
-		mod_delayed_work(system_freezable_wq, &battmgr->connector_work, 0);
 	if (ret)
 		dev_err(battmgr->dev, "failed to request power notifications\n");
 	qcom_battmgr_queue_online(battmgr, ONLINE_USB);
@@ -2423,6 +2475,9 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
 	} else {
 		WRITE_ONCE(battmgr->service_up, false);
 		battmgr->online_valid = 0;
+		battmgr->online_mask = 0;
+		battmgr->connector_source = false;
+		qcom_battmgr_connector_gate(battmgr);
 		atomic_inc(&battmgr->service_generation);
 		WRITE_ONCE(battmgr->liuqin_thermal_level, -1);
 	}
@@ -2533,6 +2588,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 		if (IS_ERR(battmgr->connector))
 			return dev_err_probe(dev, PTR_ERR(battmgr->connector),
 					     "connector thermistor unavailable\n");
+		spin_lock_init(&battmgr->connector_lock);
 		INIT_DELAYED_WORK(&battmgr->connector_work, qcom_battmgr_connector_worker);
 	}
 
@@ -2548,6 +2604,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 		return ret;
 
 	if (battmgr->connector) {
+		pmic_glink_client_watch_source_ports(battmgr->client, qcom_battmgr_source_changed);
 		ret = devm_device_add_group(dev, &connector_test_group);
 		if (ret)
 			return ret;

@@ -30,6 +30,7 @@ struct pmic_glink {
 	struct rpmsg_endpoint *ept;
 
 	unsigned long client_mask;
+	unsigned long source_ports;
 
 	struct auxiliary_device altmode_aux;
 	struct auxiliary_device ps_aux;
@@ -83,6 +84,7 @@ struct pmic_glink_client {
 
 	void (*cb)(const void *data, size_t len, void *priv);
 	void (*pdr_notify)(void *priv, int state);
+	void (*source_changed)(void *priv, unsigned long ports);
 	void *priv;
 };
 
@@ -123,6 +125,33 @@ struct pmic_glink_client *devm_pmic_glink_client_alloc(struct device *dev,
 }
 EXPORT_SYMBOL_GPL(devm_pmic_glink_client_alloc);
 
+void pmic_glink_client_watch_source_ports(struct pmic_glink_client *client,
+					  void (*changed)(void *, unsigned long))
+{
+	client->source_changed = changed;
+}
+EXPORT_SYMBOL_GPL(pmic_glink_client_watch_source_ports);
+
+void pmic_glink_set_port_source(struct pmic_glink_client *client, unsigned int port, bool source)
+{
+	struct pmic_glink *pg = client->pg;
+	unsigned long flags;
+
+	if (WARN_ON_ONCE(port >= BITS_PER_LONG))
+		return;
+
+	spin_lock_irqsave(&pg->client_lock, flags);
+	if (pg->client_state == SERVREG_SERVICE_STATE_UP &&
+	    test_bit(port, &pg->source_ports) != source) {
+		__assign_bit(port, &pg->source_ports, source);
+		list_for_each_entry(client, &pg->clients, node)
+			if (client->source_changed)
+				client->source_changed(client->priv, pg->source_ports);
+	}
+	spin_unlock_irqrestore(&pg->client_lock, flags);
+}
+EXPORT_SYMBOL_GPL(pmic_glink_set_port_source);
+
 void pmic_glink_client_register(struct pmic_glink_client *client)
 {
 	struct pmic_glink *pg = client->pg;
@@ -133,6 +162,8 @@ void pmic_glink_client_register(struct pmic_glink_client *client)
 
 	list_add(&client->node, &pg->clients);
 	client->pdr_notify(client->priv, pg->client_state);
+	if (client->source_changed)
+		client->source_changed(client->priv, pg->source_ports);
 
 	spin_unlock_irqrestore(&pg->client_lock, flags);
 }
@@ -256,10 +287,12 @@ static void pmic_glink_state_notify_clients(struct pmic_glink *pg)
 
 	if (new_state != pg->client_state) {
 		spin_lock_irqsave(&pg->client_lock, flags);
+		if (new_state != SERVREG_SERVICE_STATE_UP)
+			pg->source_ports = 0;
+		pg->client_state = new_state;
 		list_for_each_entry(client, &pg->clients, node)
 			client->pdr_notify(client->priv, new_state);
 		spin_unlock_irqrestore(&pg->client_lock, flags);
-		pg->client_state = new_state;
 	}
 }
 
