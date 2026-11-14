@@ -382,6 +382,11 @@ struct qcom_battmgr {
 
 	enum qcom_battmgr_variant variant;
 
+	struct work_struct online_work;
+	unsigned long online_pending;
+	u8 online_valid;
+	u8 online_mask;
+
 	struct power_supply *ac_psy;
 	struct power_supply *bat_psy;
 	struct power_supply *usb_psy;
@@ -1777,6 +1782,51 @@ static const struct power_supply_desc sm8350_wls_psy_desc = {
 	.get_property = qcom_battmgr_wls_get_property,
 };
 
+/* The GLINK notification carries no value. Read it outside the RX callback,
+ * using a non-freezable worker so an edge can end suspend-to-idle.
+ */
+enum battmgr_online_input {
+	ONLINE_USB,
+	ONLINE_WIRELESS,
+	ONLINE_AC,
+};
+
+static void qcom_battmgr_check_online(struct work_struct *work)
+{
+	struct qcom_battmgr *b = container_of(work, struct qcom_battmgr, online_work);
+	unsigned long pending = xchg(&b->online_pending, 0);
+
+	if (!READ_ONCE(b->service_up))
+		return;
+
+	mutex_lock(&b->lock);
+	if (b->variant == QCOM_BATTMGR_SC8280XP) {
+		qcom_battmgr_update_status(b);
+	} else {
+		if (pending & BIT(ONLINE_USB))
+			qcom_battmgr_request_property(b, BATTMGR_USB_PROPERTY_GET, USB_ONLINE, 0);
+		if (pending & BIT(ONLINE_WIRELESS))
+			qcom_battmgr_request_property(b, BATTMGR_WLS_PROPERTY_GET, WLS_ONLINE, 0);
+	}
+	mutex_unlock(&b->lock);
+}
+
+static void qcom_battmgr_queue_online(struct qcom_battmgr *b, int input)
+{
+	set_bit(input, &b->online_pending);
+	schedule_work(&b->online_work);
+}
+
+/* GLINK serializes RX and service-down callbacks under client_lock. */
+static void qcom_battmgr_online_response(struct qcom_battmgr *b, u8 mask, u8 online)
+{
+	if (((b->online_mask ^ online) & b->online_valid & mask) &&
+	    device_may_wakeup(b->dev))
+		pm_wakeup_hard_event(b->dev);
+	b->online_mask = (b->online_mask & ~mask) | online;
+	b->online_valid |= mask;
+}
+
 static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 				      const struct qcom_battmgr_message *msg,
 				      int len)
@@ -1795,13 +1845,18 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 		battmgr->info.valid = false;
 		fallthrough;
 	case NOTIF_BAT_STATUS:
+		if (battmgr->variant == QCOM_BATTMGR_SC8280XP)
+			qcom_battmgr_queue_online(battmgr, ONLINE_AC);
+		fallthrough;
 	case NOTIF_BAT_PROPERTY:
 		power_supply_changed(battmgr->bat_psy);
 		break;
 	case NOTIF_USB_PROPERTY:
+		qcom_battmgr_queue_online(battmgr, ONLINE_USB);
 		power_supply_changed(battmgr->usb_psy);
 		break;
 	case NOTIF_WLS_PROPERTY:
+		qcom_battmgr_queue_online(battmgr, ONLINE_WIRELESS);
 		power_supply_changed(battmgr->wls_psy);
 		break;
 	case NOTIF_XM_PROPERTY:
@@ -1915,6 +1970,11 @@ static void qcom_battmgr_sc8280xp_callback(struct qcom_battmgr *battmgr,
 		battmgr->ac.online = source == BATTMGR_CHARGING_SOURCE_AC;
 		battmgr->usb.online = source == BATTMGR_CHARGING_SOURCE_USB;
 		battmgr->wireless.online = source == BATTMGR_CHARGING_SOURCE_WIRELESS;
+		qcom_battmgr_online_response(battmgr, BIT(ONLINE_AC) | BIT(ONLINE_USB) |
+					     BIT(ONLINE_WIRELESS),
+					     battmgr->ac.online << ONLINE_AC |
+					     battmgr->usb.online << ONLINE_USB |
+					     battmgr->wireless.online << ONLINE_WIRELESS);
 		if (battmgr->info.last_full_capacity != 0) {
 			/*
 			 * 100 * battmgr->status.capacity can overflow a 32bit
@@ -2075,6 +2135,8 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 		switch (property) {
 		case USB_ONLINE:
 			battmgr->usb.online = le32_to_cpu(resp->intval.value);
+			qcom_battmgr_online_response(battmgr, BIT(ONLINE_USB),
+				battmgr->usb.online << ONLINE_USB);
 			break;
 		case USB_VOLT_NOW:
 			battmgr->usb.voltage_now = le32_to_cpu(resp->intval.value);
@@ -2122,6 +2184,8 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 		switch (property) {
 		case WLS_ONLINE:
 			battmgr->wireless.online = le32_to_cpu(resp->intval.value);
+			qcom_battmgr_online_response(battmgr, BIT(ONLINE_WIRELESS),
+				battmgr->wireless.online << ONLINE_WIRELESS);
 			break;
 		case WLS_VOLT_NOW:
 			battmgr->wireless.voltage_now = le32_to_cpu(resp->intval.value);
@@ -2322,6 +2386,7 @@ static void qcom_battmgr_stop_workers(void *data)
 {
 	struct qcom_battmgr *b = data;
 
+	disable_work_sync(&b->online_work);
 	disable_work_sync(&b->enable_work);
 	if (b->connector)
 		disable_delayed_work_sync(&b->connector_work);
@@ -2344,6 +2409,8 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
 		mod_delayed_work(system_freezable_wq, &battmgr->connector_work, 0);
 	if (ret)
 		dev_err(battmgr->dev, "failed to request power notifications\n");
+	qcom_battmgr_queue_online(battmgr, ONLINE_USB);
+	qcom_battmgr_queue_online(battmgr, ONLINE_WIRELESS);
 }
 
 static void qcom_battmgr_pdr_notify(void *priv, int state)
@@ -2355,6 +2422,7 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
 		schedule_work(&battmgr->enable_work);
 	} else {
 		WRITE_ONCE(battmgr->service_up, false);
+		battmgr->online_valid = 0;
 		atomic_inc(&battmgr->service_generation);
 		WRITE_ONCE(battmgr->liuqin_thermal_level, -1);
 	}
@@ -2405,6 +2473,10 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	psy_cfg_supply.no_wakeup_source = true;
 
 
+	ret = devm_device_init_wakeup(dev);
+	if (ret)
+		return ret;
+	INIT_WORK(&battmgr->online_work, qcom_battmgr_check_online);
 	INIT_WORK(&battmgr->enable_work, qcom_battmgr_enable_worker);
 	mutex_init(&battmgr->lock);
 	init_completion(&battmgr->ack);
