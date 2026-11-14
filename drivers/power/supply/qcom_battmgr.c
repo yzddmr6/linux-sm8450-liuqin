@@ -425,7 +425,8 @@ struct qcom_battmgr {
 	int liuqin_level_generation;
 
 	struct work_struct enable_work;
-	struct iio_channel *connector;
+	struct iio_channel *connector; /* acquired by connector_work */
+	bool connector_enabled;
 	struct delayed_work connector_work;
 	ktime_t connector_test_until;
 	spinlock_t connector_lock; /* serializes gate changes and periodic rearming */
@@ -1827,7 +1828,7 @@ static void qcom_battmgr_connector_gate(struct qcom_battmgr *b)
 {
 	bool active = b->service_up && (b->online_mask || b->connector_source);
 
-	if (!b->connector)
+	if (!READ_ONCE(b->connector_enabled))
 		return;
 
 	scoped_guard(spinlock, &b->connector_lock) {
@@ -2384,6 +2385,24 @@ static void qcom_battmgr_connector_worker(struct work_struct *work)
 		temp = b->connector_real_temp;
 		b->connector_test_until = 0;
 	} else {
+		/* The supplier may still be probing when GLINK first reports power.
+		 * Keep the battery supplies available while the optional ADC attaches.
+		 */
+		if (!b->connector) {
+			struct iio_channel *chan = iio_channel_get(b->dev, "connector-temp");
+
+			if (IS_ERR(chan)) {
+				ret = PTR_ERR(chan);
+				if (ret == -EPROBE_DEFER) {
+					dev_err_once(b->dev, "connector ADC unavailable; retrying while powered\n");
+					goto rearm;
+				}
+				dev_err(b->dev, "connector temperature unavailable: %pe\n", chan);
+				WRITE_ONCE(b->connector_enabled, false);
+				return;
+			}
+			b->connector = chan;
+		}
 		ret = iio_read_channel_processed(b->connector, &temp);
 		if (ret)
 			goto rearm;
@@ -2397,7 +2416,7 @@ static void qcom_battmgr_connector_worker(struct work_struct *work)
 	if (!ret)
 		WRITE_ONCE(b->connector_injected, temp != b->connector_real_temp);
 rearm:
-	if (ret)
+	if (ret && ret != -EPROBE_DEFER)
 		dev_warn_ratelimited(b->dev, "connector temperature update failed: %d\n", ret);
 	scoped_guard(spinlock_irqsave, &b->connector_lock) {
 		if (b->connector_active)
@@ -2417,6 +2436,10 @@ static ssize_t connector_hot_test_store(struct device *dev,
 	if (kstrtobool(buf, &enable))
 		return -EINVAL;
 	mutex_lock(&b->lock);
+	if (!READ_ONCE(b->connector_enabled)) {
+		mutex_unlock(&b->lock);
+		return -ENODEV;
+	}
 	if (enable && !READ_ONCE(b->connector_active)) {
 		mutex_unlock(&b->lock);
 		return -ENOTCONN;
@@ -2442,8 +2465,9 @@ static void qcom_battmgr_stop_workers(void *data)
 
 	disable_work_sync(&b->online_work);
 	disable_work_sync(&b->enable_work);
-	if (b->connector)
-		disable_delayed_work_sync(&b->connector_work);
+	disable_delayed_work_sync(&b->connector_work);
+	if (IS_REACHABLE(CONFIG_IIO) && b->connector)
+		iio_channel_release(b->connector);
 }
 
 static void qcom_battmgr_enable_worker(struct work_struct *work)
@@ -2580,16 +2604,13 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 					     "failed to register wireless charing power supply\n");
 	}
 
-	if (battmgr->variant == QCOM_BATTMGR_SM8475 &&
-	    device_property_match_string(dev, "io-channel-names", "connector-temp") >= 0) {
-		if (!IS_REACHABLE(CONFIG_IIO))
-			return -ENODEV;
-		battmgr->connector = devm_iio_channel_get(dev, "connector-temp");
-		if (IS_ERR(battmgr->connector))
-			return dev_err_probe(dev, PTR_ERR(battmgr->connector),
-					     "connector thermistor unavailable\n");
-		spin_lock_init(&battmgr->connector_lock);
-		INIT_DELAYED_WORK(&battmgr->connector_work, qcom_battmgr_connector_worker);
+	spin_lock_init(&battmgr->connector_lock);
+	INIT_DELAYED_WORK(&battmgr->connector_work, qcom_battmgr_connector_worker);
+	if (battmgr->variant == QCOM_BATTMGR_SM8475) {
+		battmgr->connector_enabled = IS_REACHABLE(CONFIG_IIO) &&
+			device_property_match_string(dev, "io-channel-names", "connector-temp") >= 0;
+		if (!battmgr->connector_enabled && of_machine_is_compatible("xiaomi,liuqin"))
+			dev_err(dev, "connector temperature channel unavailable\n");
 	}
 
 	battmgr->client = devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_BATTMGR,
@@ -2603,7 +2624,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	if (ret)
 		return ret;
 
-	if (battmgr->connector) {
+	if (battmgr->connector_enabled) {
 		pmic_glink_client_watch_source_ports(battmgr->client, qcom_battmgr_source_changed);
 		ret = devm_device_add_group(dev, &connector_test_group);
 		if (ret)
