@@ -185,6 +185,11 @@ static void pmic_glink_ucsi_connector_status(struct ucsi_connector *con)
 	struct pmic_glink_ucsi *ucsi = ucsi_get_drvdata(con->ucsi);
 	int orientation;
 
+	if (con->num && con->num <= PMIC_GLINK_MAX_PORTS)
+		pmic_glink_set_port_source(ucsi->client, con->num - 1,
+					   UCSI_CONSTAT(con, CONNECTED) &&
+					   UCSI_CONSTAT(con, PWR_DIR) == TYPEC_SOURCE);
+
 	if (!UCSI_CONSTAT(con, CONNECTED)) {
 		typec_set_orientation(con->port, TYPEC_ORIENTATION_NONE);
 		return;
@@ -412,6 +417,7 @@ static int pmic_glink_ucsi_probe(struct auxiliary_device *adev,
 static void pmic_glink_ucsi_remove(struct auxiliary_device *adev)
 {
 	struct pmic_glink_ucsi *ucsi = dev_get_drvdata(&adev->dev);
+	unsigned int port;
 
 	/* Callbacks can queue work until devres releases the client */
 	disable_work_sync(&ucsi->notify_work);
@@ -422,6 +428,8 @@ static void pmic_glink_ucsi_remove(struct auxiliary_device *adev)
 		ucsi->ucsi_registered = false;
 		ucsi_unregister(ucsi->ucsi);
 	}
+	for (port = 0; port < PMIC_GLINK_MAX_PORTS; port++)
+		pmic_glink_set_port_source(ucsi->client, port, false);
 }
 
 static const struct auxiliary_device_id pmic_glink_ucsi_id_table[] = {

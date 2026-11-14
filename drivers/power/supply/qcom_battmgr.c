@@ -8,6 +8,7 @@
 #include <linux/auxiliary_bus.h>
 #include <linux/ctype.h>
 #include <linux/hex.h>
+#include <linux/iio/consumer.h>
 #include <linux/swab.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -90,6 +91,7 @@ enum qcom_battmgr_variant {
 
 #define BATTMGR_XM_PROPERTY_GET		0x50
 #define BATTMGR_XM_PROPERTY_SET		0x51
+#define XM_CONNECTOR_TEMP		2
 #define XM_AUTHENTIC			3
 #define XM_REAL_TYPE			6
 #define XM_VERIFY_PROCESS		7
@@ -380,6 +382,11 @@ struct qcom_battmgr {
 
 	enum qcom_battmgr_variant variant;
 
+	struct work_struct online_work;
+	unsigned long online_pending;
+	u8 online_valid;
+	u8 online_mask;
+
 	struct power_supply *ac_psy;
 	struct power_supply *bat_psy;
 	struct power_supply *usb_psy;
@@ -418,6 +425,15 @@ struct qcom_battmgr {
 	int liuqin_level_generation;
 
 	struct work_struct enable_work;
+	struct iio_channel *connector; /* acquired by connector_work */
+	bool connector_enabled;
+	struct delayed_work connector_work;
+	ktime_t connector_test_until;
+	spinlock_t connector_lock; /* serializes gate changes and periodic rearming */
+	bool connector_active;
+	bool connector_source;
+	bool connector_injected;
+	int connector_real_temp;
 
 	/*
 	 * @lock is used to prevent concurrent power supply requests to the
@@ -530,12 +546,14 @@ static int qcom_battmgr_xm_get_words_locked(struct qcom_battmgr *battmgr,
 /*
  * SET is restricted to the properties the vendor authentication daemon
  * (batterysecret) writes: battery/adapter authentication verdicts, the
- * verification-in-progress flag and the UVDM command channel.  There is no
+ * verification-in-progress flag and the UVDM command channel.  There is a
+ * separate connector thermistor update for firmware thermal policy. No
  * arbitrary XM-property write path and no current, voltage or PMIC write.
  */
 static bool qcom_battmgr_xm_set_allowed(u32 property)
 {
 	switch (property) {
+	case XM_CONNECTOR_TEMP:
 	case XM_AUTHENTIC:
 	case XM_SLAVE_AUTHENTIC:
 	case XM_VERIFY_PROCESS:
@@ -714,6 +732,7 @@ static ssize_t _name##_show(struct device *dev, \
 static DEVICE_ATTR_RO(_name)
 
 QCOM_BATTMGR_RAW_ATTR(raw_usb_real_type, BATTMGR_USB_PROPERTY_GET, USB_REAL_TYPE);
+QCOM_BATTMGR_RAW_ATTR(raw_xm_connector_temp, BATTMGR_XM_PROPERTY_GET, XM_CONNECTOR_TEMP);
 QCOM_BATTMGR_RAW_ATTR(raw_xm_authentic, BATTMGR_XM_PROPERTY_GET, XM_AUTHENTIC);
 QCOM_BATTMGR_RAW_ATTR(raw_xm_real_type, BATTMGR_XM_PROPERTY_GET, XM_REAL_TYPE);
 QCOM_BATTMGR_RAW_ATTR(raw_xm_verify_process, BATTMGR_XM_PROPERTY_GET, XM_VERIFY_PROCESS);
@@ -729,6 +748,7 @@ QCOM_BATTMGR_RAW_ATTR(raw_xm_power_max, BATTMGR_XM_PROPERTY_GET, XM_POWER_MAX);
 
 static struct attribute *qcom_battmgr_raw_attrs[] = {
 	&dev_attr_raw_usb_real_type.attr,
+	&dev_attr_raw_xm_connector_temp.attr,
 	&dev_attr_raw_xm_authentic.attr,
 	&dev_attr_raw_xm_real_type.attr,
 	&dev_attr_raw_xm_verify_process.attr,
@@ -1768,6 +1788,79 @@ static const struct power_supply_desc sm8350_wls_psy_desc = {
 	.get_property = qcom_battmgr_wls_get_property,
 };
 
+/* The GLINK notification carries no value. Read it outside the RX callback,
+ * using a non-freezable worker so an edge can end suspend-to-idle.
+ */
+enum battmgr_online_input {
+	ONLINE_USB,
+	ONLINE_WIRELESS,
+	ONLINE_AC,
+};
+
+static void qcom_battmgr_check_online(struct work_struct *work)
+{
+	struct qcom_battmgr *b = container_of(work, struct qcom_battmgr, online_work);
+	unsigned long pending = xchg(&b->online_pending, 0);
+
+	if (!READ_ONCE(b->service_up))
+		return;
+
+	mutex_lock(&b->lock);
+	if (b->variant == QCOM_BATTMGR_SC8280XP) {
+		qcom_battmgr_update_status(b);
+	} else {
+		if (pending & BIT(ONLINE_USB))
+			qcom_battmgr_request_property(b, BATTMGR_USB_PROPERTY_GET, USB_ONLINE, 0);
+		if (pending & BIT(ONLINE_WIRELESS))
+			qcom_battmgr_request_property(b, BATTMGR_WLS_PROPERTY_GET, WLS_ONLINE, 0);
+	}
+	mutex_unlock(&b->lock);
+}
+
+static void qcom_battmgr_queue_online(struct qcom_battmgr *b, int input)
+{
+	set_bit(input, &b->online_pending);
+	schedule_work(&b->online_work);
+}
+
+/* Called by GLINK with client_lock held, including the initial role replay. */
+static void qcom_battmgr_connector_gate(struct qcom_battmgr *b)
+{
+	bool active = b->service_up && (b->online_mask || b->connector_source);
+
+	if (!READ_ONCE(b->connector_enabled))
+		return;
+
+	scoped_guard(spinlock, &b->connector_lock) {
+		if (active == b->connector_active)
+			return;
+		WRITE_ONCE(b->connector_active, active);
+		if (active || READ_ONCE(b->connector_injected))
+			mod_delayed_work(system_freezable_wq, &b->connector_work, 0);
+		else
+			cancel_delayed_work(&b->connector_work);
+	}
+}
+
+static void qcom_battmgr_source_changed(void *priv, unsigned long ports)
+{
+	struct qcom_battmgr *b = priv;
+
+	b->connector_source = ports & BIT(0);
+	qcom_battmgr_connector_gate(b);
+}
+
+/* GLINK serializes RX and service-down callbacks under client_lock. */
+static void qcom_battmgr_online_response(struct qcom_battmgr *b, u8 mask, u8 online)
+{
+	if (((b->online_mask ^ online) & b->online_valid & mask) &&
+	    device_may_wakeup(b->dev))
+		pm_wakeup_hard_event(b->dev);
+	b->online_mask = (b->online_mask & ~mask) | online;
+	b->online_valid |= mask;
+	qcom_battmgr_connector_gate(b);
+}
+
 static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 				      const struct qcom_battmgr_message *msg,
 				      int len)
@@ -1786,13 +1879,18 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 		battmgr->info.valid = false;
 		fallthrough;
 	case NOTIF_BAT_STATUS:
+		if (battmgr->variant == QCOM_BATTMGR_SC8280XP)
+			qcom_battmgr_queue_online(battmgr, ONLINE_AC);
+		fallthrough;
 	case NOTIF_BAT_PROPERTY:
 		power_supply_changed(battmgr->bat_psy);
 		break;
 	case NOTIF_USB_PROPERTY:
+		qcom_battmgr_queue_online(battmgr, ONLINE_USB);
 		power_supply_changed(battmgr->usb_psy);
 		break;
 	case NOTIF_WLS_PROPERTY:
+		qcom_battmgr_queue_online(battmgr, ONLINE_WIRELESS);
 		power_supply_changed(battmgr->wls_psy);
 		break;
 	case NOTIF_XM_PROPERTY:
@@ -1906,6 +2004,11 @@ static void qcom_battmgr_sc8280xp_callback(struct qcom_battmgr *battmgr,
 		battmgr->ac.online = source == BATTMGR_CHARGING_SOURCE_AC;
 		battmgr->usb.online = source == BATTMGR_CHARGING_SOURCE_USB;
 		battmgr->wireless.online = source == BATTMGR_CHARGING_SOURCE_WIRELESS;
+		qcom_battmgr_online_response(battmgr, BIT(ONLINE_AC) | BIT(ONLINE_USB) |
+					     BIT(ONLINE_WIRELESS),
+					     battmgr->ac.online << ONLINE_AC |
+					     battmgr->usb.online << ONLINE_USB |
+					     battmgr->wireless.online << ONLINE_WIRELESS);
 		if (battmgr->info.last_full_capacity != 0) {
 			/*
 			 * 100 * battmgr->status.capacity can overflow a 32bit
@@ -2066,6 +2169,8 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 		switch (property) {
 		case USB_ONLINE:
 			battmgr->usb.online = le32_to_cpu(resp->intval.value);
+			qcom_battmgr_online_response(battmgr, BIT(ONLINE_USB),
+				battmgr->usb.online << ONLINE_USB);
 			break;
 		case USB_VOLT_NOW:
 			battmgr->usb.voltage_now = le32_to_cpu(resp->intval.value);
@@ -2113,6 +2218,8 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 		switch (property) {
 		case WLS_ONLINE:
 			battmgr->wireless.online = le32_to_cpu(resp->intval.value);
+			qcom_battmgr_online_response(battmgr, BIT(ONLINE_WIRELESS),
+				battmgr->wireless.online << ONLINE_WIRELESS);
 			break;
 		case WLS_VOLT_NOW:
 			battmgr->wireless.voltage_now = le32_to_cpu(resp->intval.value);
@@ -2260,6 +2367,109 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
 		qcom_battmgr_sm8350_callback(battmgr, data, len);
 }
 
+/* The active mi_thermald connector monitor sleeps 1000000 us between samples. */
+static void qcom_battmgr_connector_worker(struct work_struct *work)
+{
+	struct qcom_battmgr *b = container_of(to_delayed_work(work),
+					      struct qcom_battmgr, connector_work);
+	int temp, ret;
+
+	if (!IS_REACHABLE(CONFIG_IIO) || !READ_ONCE(b->service_up))
+		return;
+
+	guard(mutex)(&b->lock);
+	if (!READ_ONCE(b->connector_active)) {
+		/* A fake hot sample may itself have caused the USB offline edge. */
+		if (!b->connector_injected)
+			return;
+		temp = b->connector_real_temp;
+		b->connector_test_until = 0;
+	} else {
+		/* The supplier may still be probing when GLINK first reports power.
+		 * Keep the battery supplies available while the optional ADC attaches.
+		 */
+		if (!b->connector) {
+			struct iio_channel *chan = iio_channel_get(b->dev, "connector-temp");
+
+			if (IS_ERR(chan)) {
+				ret = PTR_ERR(chan);
+				if (ret == -EPROBE_DEFER) {
+					dev_err_once(b->dev, "connector ADC unavailable; retrying while powered\n");
+					goto rearm;
+				}
+				dev_err(b->dev, "connector temperature unavailable: %pe\n", chan);
+				WRITE_ONCE(b->connector_enabled, false);
+				return;
+			}
+			b->connector = chan;
+		}
+		ret = iio_read_channel_processed(b->connector, &temp);
+		if (ret < 0)
+			goto rearm;
+		temp = DIV_ROUND_CLOSEST(temp, 100);
+		b->connector_real_temp = temp;
+		if (ktime_before(ktime_get_boottime(), b->connector_test_until))
+			temp = max(temp, 750);
+	}
+
+	ret = qcom_battmgr_xm_set_value_locked(b, XM_CONNECTOR_TEMP, temp);
+	if (!ret)
+		WRITE_ONCE(b->connector_injected, temp != b->connector_real_temp);
+rearm:
+	if (ret < 0 && ret != -EPROBE_DEFER)
+		dev_warn_ratelimited(b->dev, "connector temperature update failed: %d\n", ret);
+	scoped_guard(spinlock_irqsave, &b->connector_lock) {
+		if (b->connector_active)
+			queue_delayed_work(system_freezable_wq, &b->connector_work, HZ);
+		else if (!ret && b->connector_injected)
+			queue_delayed_work(system_freezable_wq, &b->connector_work, 0);
+	}
+}
+
+static ssize_t connector_hot_test_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct qcom_battmgr *b = dev_get_drvdata(dev);
+	bool enable;
+
+	if (kstrtobool(buf, &enable))
+		return -EINVAL;
+	mutex_lock(&b->lock);
+	if (!READ_ONCE(b->connector_enabled)) {
+		mutex_unlock(&b->lock);
+		return -ENODEV;
+	}
+	if (enable && !READ_ONCE(b->connector_active)) {
+		mutex_unlock(&b->lock);
+		return -ENOTCONN;
+	}
+	b->connector_test_until = enable ? ktime_add_ms(ktime_get_boottime(), 10000) : 0;
+	mutex_unlock(&b->lock);
+	mod_delayed_work(system_freezable_wq, &b->connector_work, 0);
+	return count;
+}
+static DEVICE_ATTR_WO(connector_hot_test);
+
+static struct attribute *connector_test_attrs[] = {
+	&dev_attr_connector_hot_test.attr,
+	NULL
+};
+static const struct attribute_group connector_test_group = {
+	.attrs = connector_test_attrs,
+};
+
+static void qcom_battmgr_stop_workers(void *data)
+{
+	struct qcom_battmgr *b = data;
+
+	disable_work_sync(&b->online_work);
+	disable_work_sync(&b->enable_work);
+	disable_delayed_work_sync(&b->connector_work);
+	if (IS_REACHABLE(CONFIG_IIO) && b->connector)
+		iio_channel_release(b->connector);
+}
+
 static void qcom_battmgr_enable_worker(struct work_struct *work)
 {
 	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr, enable_work);
@@ -2270,9 +2480,13 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
 	};
 	int ret;
 
+	mutex_lock(&battmgr->lock);
 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
+	mutex_unlock(&battmgr->lock);
 	if (ret)
 		dev_err(battmgr->dev, "failed to request power notifications\n");
+	qcom_battmgr_queue_online(battmgr, ONLINE_USB);
+	qcom_battmgr_queue_online(battmgr, ONLINE_WIRELESS);
 }
 
 static void qcom_battmgr_pdr_notify(void *priv, int state)
@@ -2284,6 +2498,10 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
 		schedule_work(&battmgr->enable_work);
 	} else {
 		WRITE_ONCE(battmgr->service_up, false);
+		battmgr->online_valid = 0;
+		battmgr->online_mask = 0;
+		battmgr->connector_source = false;
+		qcom_battmgr_connector_gate(battmgr);
 		atomic_inc(&battmgr->service_generation);
 		WRITE_ONCE(battmgr->liuqin_thermal_level, -1);
 	}
@@ -2308,6 +2526,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	const struct of_device_id *match;
 	struct qcom_battmgr *battmgr;
 	struct device *dev = &adev->dev;
+	int ret;
 
 	battmgr = devm_kzalloc(dev, sizeof(*battmgr), GFP_KERNEL);
 	if (!battmgr)
@@ -2333,6 +2552,10 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	psy_cfg_supply.no_wakeup_source = true;
 
 
+	ret = devm_device_init_wakeup(dev);
+	if (ret)
+		return ret;
+	INIT_WORK(&battmgr->online_work, qcom_battmgr_check_online);
 	INIT_WORK(&battmgr->enable_work, qcom_battmgr_enable_worker);
 	mutex_init(&battmgr->lock);
 	init_completion(&battmgr->ack);
@@ -2381,6 +2604,15 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 					     "failed to register wireless charing power supply\n");
 	}
 
+	spin_lock_init(&battmgr->connector_lock);
+	INIT_DELAYED_WORK(&battmgr->connector_work, qcom_battmgr_connector_worker);
+	if (battmgr->variant == QCOM_BATTMGR_SM8475) {
+		battmgr->connector_enabled = IS_REACHABLE(CONFIG_IIO) &&
+			device_property_match_string(dev, "io-channel-names", "connector-temp") >= 0;
+		if (!battmgr->connector_enabled && of_machine_is_compatible("xiaomi,liuqin"))
+			dev_err(dev, "connector temperature channel unavailable\n");
+	}
+
 	battmgr->client = devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_BATTMGR,
 						       qcom_battmgr_callback,
 						       qcom_battmgr_pdr_notify,
@@ -2388,11 +2620,20 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	if (IS_ERR(battmgr->client))
 		return PTR_ERR(battmgr->client);
 
+	ret = devm_add_action_or_reset(dev, qcom_battmgr_stop_workers, battmgr);
+	if (ret)
+		return ret;
+
+	if (battmgr->connector_enabled) {
+		pmic_glink_client_watch_source_ports(battmgr->client, qcom_battmgr_source_changed);
+		ret = devm_device_add_group(dev, &connector_test_group);
+		if (ret)
+			return ret;
+	}
+
 	pmic_glink_client_register(battmgr->client);
 
 	if (battmgr->variant == QCOM_BATTMGR_SM8475) {
-		int ret;
-
 		ret = devm_device_add_group(dev, &qcom_battmgr_raw_group);
 		if (ret)
 			return ret;

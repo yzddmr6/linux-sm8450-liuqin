@@ -28,6 +28,10 @@ struct pmic_glink_client *devm_pmic_glink_client_alloc(struct device *dev,
 						       void (*cb)(const void *, size_t, void *),
 						       void (*pdr)(void *, int),
 						       void *priv);
+/* Install before registration. Callback runs under the GLINK client spinlock. */
+void pmic_glink_client_watch_source_ports(struct pmic_glink_client *client,
+					  void (*changed)(void *, unsigned long));
+void pmic_glink_set_port_source(struct pmic_glink_client *client, unsigned int port, bool source);
 void pmic_glink_client_register(struct pmic_glink_client *client);
 
 #endif

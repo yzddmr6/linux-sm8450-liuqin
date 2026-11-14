@@ -252,6 +252,8 @@
 		compatible = "qcom,sm8475-pmic-glink",
 			     "qcom,sm8450-pmic-glink",
 			     "qcom,pmic-glink";
+		io-channels = <&pmk8350_vadc PM8350B_ADC7_AMUX_THM4_100K_PU>;
+		io-channel-names = "connector-temp";
 		#address-cells = <1>;
 		#size-cells = <0>;
 
@@ -1421,6 +1423,14 @@
 		qcom,pre-scaling = <1 1>;
 	};
 
+	channel@347 {
+		reg = <PM8350B_ADC7_AMUX_THM4_100K_PU>;
+		label = "conn_therm";
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+		qcom,pre-scaling = <1 1>;
+	};
+
 	channel@34d {
 		reg = <PM8350B_ADC7_GPIO4_100K_PU>;
 		label = "charger_therm0";
@@ -2119,4 +2129,9 @@
 			};
 		};
 	};
+};
+
+/* RAM standby candidate: qce holds an ALWAYS DDR vote without PM callbacks. */
+&crypto {
+	status = "disabled";
 };

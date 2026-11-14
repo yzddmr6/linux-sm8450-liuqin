@@ -34,6 +34,7 @@ struct backlight_device;
 struct dentry;
 struct device_node;
 struct drm_connector;
+struct drm_crtc;
 struct drm_panel_follower;
 struct drm_panel;
 struct display_timing;
@@ -160,6 +161,20 @@ struct drm_panel_follower_funcs {
 	 * Called before the panel is powered off.
 	 */
 	int (*panel_unpreparing)(struct drm_panel_follower *follower);
+
+	/**
+	 * @panel_enabled:
+	 *
+	 * Called after the panel and the backlight have been enabled.
+	 */
+	int (*panel_enabled)(struct drm_panel_follower *follower);
+
+	/**
+	 * @panel_disabling:
+	 *
+	 * Called before the panel and the backlight are disabled.
+	 */
+	int (*panel_disabling)(struct drm_panel_follower *follower);
 };
 
 struct drm_panel_follower {
@@ -213,6 +228,15 @@ struct drm_panel {
 	 * Operations that can be performed on the panel.
 	 */
 	const struct drm_panel_funcs *funcs;
+
+	/**
+	 * @active_crtc: Scanout driving an enabled atomic panel bridge.
+	 *
+	 * Valid from panel_enabled through panel_disabling. A follower using
+	 * this pointer asynchronously must drain its work in panel_disabling.
+	 * NULL for panels driven without an atomic panel bridge.
+	 */
+	struct drm_crtc *active_crtc;
 
 	/**
 	 * @connector_type:
