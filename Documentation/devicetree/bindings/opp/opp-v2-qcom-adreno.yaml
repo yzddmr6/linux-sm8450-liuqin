@@ -36,6 +36,13 @@ patternProperties:
 
       opp-supported-hw: true
 
+      qcom,opp-cx-level:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description:
+          Minimum CX RPMh voltage corner requested by the GMU at this GPU
+          frequency. On Adreno 730 platforms requiring GX to CX votes, define
+          this property on every available GPU operating point.
+
       qcom,opp-acd-level:
         description: |
           A positive value representing the ACD (Adaptive Clock Distribution,

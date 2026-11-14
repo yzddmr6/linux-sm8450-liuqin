@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /dts-v1/;
 
+#include <dt-bindings/iio/qcom,spmi-adc7-pm8350.h>
+#include <dt-bindings/iio/qcom,spmi-adc7-pm8350b.h>
+#include <dt-bindings/iio/qcom,spmi-adc7-pmr735a.h>
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
@@ -679,6 +682,65 @@
 	status = "okay";
 };
 
+/* The stock Adreno730v3 HFI table carries a CX dependency at every GX OPP.
+ * Each retained frequency uses the corner of the covering factory OPP.
+ */
+&gpu_opp_table {
+	compatible = "operating-points-v2-adreno", "operating-points-v2";
+
+	opp-220000000 {
+		opp-level = <RPMH_REGULATOR_LEVEL_MIN_SVS>;
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_LOW_SVS>;
+	};
+
+	opp-285000000 {
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_LOW_SVS>;
+	};
+
+	opp-317000000 {
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_LOW_SVS>;
+	};
+
+	opp-350000000 {
+		opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_L1>;
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_SVS>;
+	};
+
+	opp-421000000 {
+		opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_L2>;
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_SVS>;
+	};
+
+	opp-492000000 {
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_SVS>;
+	};
+
+	opp-545000000 {
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_SVS_L1>;
+	};
+
+	opp-599000000 {
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_SVS_L1>;
+	};
+
+	opp-640000000 {
+		opp-level = <RPMH_REGULATOR_LEVEL_SVS_L1>;
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_SVS_L1>;
+	};
+
+	opp-734000000 {
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_NOM>;
+	};
+
+	opp-791000000 {
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_NOM_L1>;
+	};
+
+	opp-818000000 {
+		qcom,opp-cx-level = <RPMH_REGULATOR_LEVEL_TURBO>;
+	};
+};
+
 &gpu {
 	status = "okay";
 
@@ -859,6 +921,9 @@
  * protection firmware block exceeds mainline's one-second timeout at 100 kHz.
  */
 &i2c15 {
+	/* Fixed 19.2 MHz source used by the 400 kHz I2C timing table. */
+	power-domains = <&rpmhpd RPMHPD_CX>, <&rpmhpd RPMHPD_MX>;
+	required-opps = <&rpmhpd_opp_low_svs>, <&rpmhpd_opp_low_svs>;
 	clock-frequency = <400000>;
 	status = "okay";
 
@@ -910,6 +975,9 @@
 };
 
 &i2c17 {
+	/* Fixed 19.2 MHz source used by the 400 kHz I2C timing table. */
+	power-domains = <&rpmhpd RPMHPD_CX>, <&rpmhpd RPMHPD_MX>;
+	required-opps = <&rpmhpd_opp_low_svs>, <&rpmhpd_opp_low_svs>;
 	clock-frequency = <400000>;
 	status = "okay";
 
@@ -1122,6 +1190,29 @@
 	status = "okay";
 };
 
+/* Cape DISP_CC_MDP_CLK_SRC votes both vdd_mm and vdd_mxa. */
+&mdss_mdp {
+	power-domains = <&rpmhpd RPMHPD_MMCX>, <&rpmhpd RPMHPD_MX>;
+};
+
+&mdp_opp_table {
+	opp-172000000 {
+		required-opps = <&rpmhpd_opp_low_svs_d1>, <&rpmhpd_opp_low_svs_d1>;
+	};
+	opp-200000000 {
+		required-opps = <&rpmhpd_opp_low_svs>, <&rpmhpd_opp_low_svs>;
+	};
+	opp-325000000 {
+		required-opps = <&rpmhpd_opp_svs>, <&rpmhpd_opp_svs>;
+	};
+	opp-375000000 {
+		required-opps = <&rpmhpd_opp_svs_l1>, <&rpmhpd_opp_svs_l1>;
+	};
+	opp-500000000 {
+		required-opps = <&rpmhpd_opp_nom>, <&rpmhpd_opp_nom>;
+	};
+};
+
 &mdss_dsi0 {
 	vdda-supply = <&pm8350c_l10>;
 
@@ -1310,6 +1401,40 @@
 		output-enable;
 		bias-disable;
 		qcom,drive-strength = <PMIC_GPIO_STRENGTH_MED>;
+	};
+};
+
+&pmk8350_vadc {
+	channel@144 {
+		reg = <PM8350_ADC7_AMUX_THM1_100K_PU(1)>;
+		label = "cpu_therm";
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+		qcom,pre-scaling = <1 1>;
+	};
+
+	channel@146 {
+		reg = <PM8350_ADC7_AMUX_THM3_100K_PU(1)>;
+		label = "quiet_therm";
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+		qcom,pre-scaling = <1 1>;
+	};
+
+	channel@34d {
+		reg = <PM8350B_ADC7_GPIO4_100K_PU>;
+		label = "charger_therm0";
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+		qcom,pre-scaling = <1 1>;
+	};
+
+	channel@44c {
+		reg = <PMR735A_ADC7_GPIO3_100K_PU>;
+		label = "wifi_therm";
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+		qcom,pre-scaling = <1 1>;
 	};
 };
 

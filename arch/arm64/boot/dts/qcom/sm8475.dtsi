@@ -14,6 +14,84 @@
 
 
 &soc {
+	pmu@19091000 {
+		compatible = "qcom,sm8475-llcc-bwmon", "qcom,sc7280-llcc-bwmon";
+		reg = <0 0x19091000 0 0x1000>;
+		interrupts = <GIC_SPI 81 IRQ_TYPE_LEVEL_HIGH>;
+		interconnects = <&mc_virt MASTER_LLCC QCOM_ICC_TAG_ACTIVE_ONLY
+				 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ACTIVE_ONLY>;
+		operating-points-v2 = <&llcc_bwmon_opp_table>;
+
+		llcc_bwmon_opp_table: opp-table {
+			compatible = "operating-points-v2";
+
+			opp-0 {
+				opp-peak-kBps = <1720000>;
+			};
+
+			opp-1 {
+				opp-peak-kBps = <2086000>;
+			};
+
+			opp-2 {
+				opp-peak-kBps = <2929000>;
+			};
+
+			opp-3 {
+				opp-peak-kBps = <3879000>;
+			};
+
+			opp-4 {
+				opp-peak-kBps = <6515000>;
+			};
+
+			opp-5 {
+				opp-peak-kBps = <7980000>;
+			};
+
+			opp-6 {
+				opp-peak-kBps = <12191000>;
+			};
+		};
+	};
+
+	pmu@190b6400 {
+		compatible = "qcom,sm8475-cpu-bwmon", "qcom,sdm845-bwmon";
+		reg = <0 0x190b6400 0 0x300>;
+		interrupts = <GIC_SPI 581 IRQ_TYPE_LEVEL_HIGH>;
+		interconnects = <&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ACTIVE_ONLY
+				 &gem_noc SLAVE_LLCC QCOM_ICC_TAG_ACTIVE_ONLY>;
+		operating-points-v2 = <&cpu_bwmon_opp_table>;
+
+		cpu_bwmon_opp_table: opp-table {
+			compatible = "operating-points-v2";
+
+			opp-0 {
+				opp-peak-kBps = <4577000>;
+			};
+
+			opp-1 {
+				opp-peak-kBps = <7110000>;
+			};
+
+			opp-2 {
+				opp-peak-kBps = <9155000>;
+			};
+
+			opp-3 {
+				opp-peak-kBps = <12298000>;
+			};
+
+			opp-4 {
+				opp-peak-kBps = <14236000>;
+			};
+
+			opp-5 {
+				opp-peak-kBps = <15258000>;
+			};
+		};
+	};
+
 	usb_1_hsphy: phy@88e3000 {
 		compatible = "qcom,sm8475-snps-eusb2-phy",
 			     "qcom,sm8550-snps-eusb2-phy";
@@ -51,6 +129,46 @@
 
 &camcc {
 	compatible = "qcom,sm8475-camcc";
+};
+
+&cpu0 {
+	capacity-dmips-mhz = <1024>;
+	dynamic-power-coefficient = <100>;
+};
+
+&cpu1 {
+	capacity-dmips-mhz = <1024>;
+	dynamic-power-coefficient = <100>;
+};
+
+&cpu2 {
+	capacity-dmips-mhz = <1024>;
+	dynamic-power-coefficient = <100>;
+};
+
+&cpu3 {
+	capacity-dmips-mhz = <1024>;
+	dynamic-power-coefficient = <100>;
+};
+
+&cpu4 {
+	capacity-dmips-mhz = <2253>;
+	dynamic-power-coefficient = <257>;
+};
+
+&cpu5 {
+	capacity-dmips-mhz = <2253>;
+	dynamic-power-coefficient = <257>;
+};
+
+&cpu6 {
+	capacity-dmips-mhz = <2253>;
+	dynamic-power-coefficient = <257>;
+};
+
+&cpu7 {
+	capacity-dmips-mhz = <2386>;
+	dynamic-power-coefficient = <509>;
 };
 
 &dispcc {

@@ -12,6 +12,7 @@
 #include <linux/debugfs.h>
 #include <linux/dma-buf.h>
 #include <linux/of_irq.h>
+#include <linux/pm_domain.h>
 #include <linux/pm_opp.h>
 
 #include <drm/drm_crtc.h>
@@ -1415,6 +1416,19 @@ static int dpu_dev_probe(struct platform_device *pdev)
 
 	dpu_kms->pdev = pdev;
 
+	/* Some display clocks require performance votes on two independent rails. */
+	if (of_count_phandle_with_args(dev->of_node, "power-domains",
+				       "#power-domain-cells") > 1) {
+		struct dev_pm_domain_attach_data data = {
+			.pd_flags = PD_FLAG_REQUIRED_OPP,
+		};
+		struct dev_pm_domain_list *domains;
+
+		ret = devm_pm_domain_attach_list(dev, &data, &domains);
+		if (ret < 0)
+			return dev_err_probe(dev, ret, "failed to attach OPP domains\n");
+	}
+
 	ret = devm_pm_opp_set_clkname(dev, "core");
 	if (ret)
 		return ret;
@@ -1461,14 +1475,50 @@ static int __maybe_unused dpu_runtime_suspend(struct device *dev)
 	struct msm_drm_private *priv = platform_get_drvdata(pdev);
 	struct dpu_kms *dpu_kms = to_dpu_kms(priv->kms);
 
-	/* Drop the performance state vote */
-	dev_pm_opp_set_rate(dev, 0);
 	clk_bulk_disable_unprepare(dpu_kms->num_clocks, dpu_kms->clocks);
 
 	for (i = 0; i < dpu_kms->num_paths; i++)
 		icc_set_bw(dpu_kms->path[i], 0, 0);
 
 	return 0;
+}
+
+/*
+ * Disabling the last CRTC drops the core clock's performance vote through
+ * dev_pm_opp_set_rate(dev, 0), and the power domain restores exactly that
+ * on runtime resume. The clock keeps its rate though, and runs at it as
+ * soon as it is enabled below, well before the first CRTC update votes
+ * again. Put the vote for that rate back before the clock is enabled.
+ */
+static int dpu_kms_restore_core_clk_vote(struct dpu_kms *dpu_kms)
+{
+	struct clk *core_clk;
+	unsigned long rate;
+	int ret;
+
+	/*
+	 * The resume in dpu_kms_hw_init() comes before the perf limits are
+	 * known, but after dpu_kms_init() voted for the highest OPP.
+	 */
+	if (!dpu_kms->perf.max_core_clk_rate)
+		return 0;
+
+	core_clk = msm_clk_bulk_get_clock(dpu_kms->clocks, dpu_kms->num_clocks,
+					  "core");
+	if (!core_clk)
+		return 0;
+
+	rate = clk_get_rate(core_clk);
+	if (!rate)
+		return 0;
+
+	rate = min_t(unsigned long, rate, dpu_kms->perf.max_core_clk_rate);
+	ret = dev_pm_opp_set_rate(&dpu_kms->pdev->dev, rate);
+	if (ret)
+		DPU_ERROR("failed to vote for core clock rate %lu: %d\n",
+			  rate, ret);
+
+	return ret;
 }
 
 static int __maybe_unused dpu_runtime_resume(struct device *dev)
@@ -1481,6 +1531,10 @@ static int __maybe_unused dpu_runtime_resume(struct device *dev)
 	struct drm_device *ddev;
 
 	ddev = dpu_kms->dev;
+
+	rc = dpu_kms_restore_core_clk_vote(dpu_kms);
+	if (rc)
+		return rc;
 
 	rc = clk_bulk_prepare_enable(dpu_kms->num_clocks, dpu_kms->clocks);
 	if (rc) {

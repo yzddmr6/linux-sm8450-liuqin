@@ -257,14 +257,15 @@ static int a6xx_hfi_send_perf_table_v1(struct a6xx_gmu *gmu)
 static int a6xx_hfi_send_perf_table(struct a6xx_gmu *gmu)
 {
 	struct a6xx_hfi_msg_perf_table msg = { 0 };
-	int i;
+	int i, ret;
 
 	msg.num_gpu_levels = gmu->nr_gpu_freqs;
 	msg.num_gmu_levels = gmu->nr_gmu_freqs;
 
 	for (i = 0; i < gmu->nr_gpu_freqs; i++) {
 		msg.gx_votes[i].vote = gmu->gx_arc_votes[i];
-		msg.gx_votes[i].acd = 0xffffffff;
+		msg.gx_votes[i].acd = gmu->has_gx_cx_votes ?
+			gmu->gx_cx_votes[i] : U32_MAX;
 		msg.gx_votes[i].freq = gmu->gpu_freqs[i] / 1000;
 	}
 
@@ -273,8 +274,11 @@ static int a6xx_hfi_send_perf_table(struct a6xx_gmu *gmu)
 		msg.cx_votes[i].freq = gmu->gmu_freqs[i] / 1000;
 	}
 
-	return a6xx_hfi_send_msg(gmu, HFI_H2F_MSG_PERF_TABLE, &msg, sizeof(msg),
-		NULL, 0);
+	ret = a6xx_hfi_send_msg(gmu, HFI_H2F_MSG_PERF_TABLE, &msg, sizeof(msg), NULL, 0);
+	if (!ret && gmu->has_gx_cx_votes)
+		dev_info_once(gmu->dev, "GMU acknowledged CX dependencies for %d GPU OPPs\n",
+			      gmu->nr_gpu_freqs - 1);
+	return ret;
 }
 
 static void a6xx_generate_bw_table(const struct a6xx_info *info, struct a6xx_gmu *gmu,
