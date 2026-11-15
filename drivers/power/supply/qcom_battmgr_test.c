@@ -14,11 +14,14 @@
  * b13b976e8a0d5ce2256df4f96368a6de0999aecf4dd311a9ded0f993e2cedf6b, from the
  * ROM whose ADSP firmware the liuqin images ship). Battery readings are the
  * liuqin stock-sysfs units recorded by the liuqin-nixos telemetry test.
- * The input current limit follows stock usb_psy_set_icl() and the stock PHY.
+ * The input current limit follows stock usb_psy_set_icl() and the stock PHY,
+ * the reported USB type stock battery_chg_update_usb_type_work().
  */
 #include <kunit/device.h>
 #include <kunit/static_stub.h>
 #include <kunit/test.h>
+
+#include "power_supply.h"	/* power_supply_uevent(), power_supply_attr_groups */
 
 struct battmgr_fake {
 	struct qcom_battmgr *b;
@@ -717,6 +720,118 @@ static void battmgr_test_icl_default(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, b->usb_icl_ua, 500000);
 }
 
+static void battmgr_test_usb_type_values(struct kunit *test)
+{
+	/* Raw USB_ADAP_TYPE, then the usb_type the class can report. */
+	const u32 cases[][2] = {
+		{ 0, POWER_SUPPLY_USB_TYPE_UNKNOWN },
+		{ 1, POWER_SUPPLY_USB_TYPE_SDP },
+		{ 2, POWER_SUPPLY_USB_TYPE_DCP },
+		{ 3, POWER_SUPPLY_USB_TYPE_CDP },
+		{ 4, POWER_SUPPLY_USB_TYPE_ACA },
+		{ 5, POWER_SUPPLY_USB_TYPE_C },
+		{ 6, POWER_SUPPLY_USB_TYPE_PD },
+		{ 7, POWER_SUPPLY_USB_TYPE_PD_DRP },
+		{ 8, POWER_SUPPLY_USB_TYPE_PD_PPS },
+		{ 9, POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID },
+		{ 0x80, POWER_SUPPLY_USB_TYPE_DCP },		/* HVDCP */
+		{ 0x81, POWER_SUPPLY_USB_TYPE_DCP },		/* HVDCP 3 */
+		{ 0x82, POWER_SUPPLY_USB_TYPE_DCP },		/* HVDCP 3.5 */
+		{ 0x83, POWER_SUPPLY_USB_TYPE_UNKNOWN },	/* floating */
+		{ 0x84, POWER_SUPPLY_USB_TYPE_DCP },		/* HVDCP 3 class B */
+		{ 10, POWER_SUPPLY_USB_TYPE_UNKNOWN },
+		{ 0x85, POWER_SUPPLY_USB_TYPE_UNKNOWN },
+		{ 0xffffffff, POWER_SUPPLY_USB_TYPE_UNKNOWN },
+	};
+	struct battmgr_fake *fw = test->priv;
+	struct power_supply *psy = kunit_kzalloc(test, sizeof(*psy), GFP_KERNEL);
+	union power_supply_propval val;
+
+	KUNIT_ASSERT_NOT_NULL(test, psy);
+	psy->drv_data = fw->b;
+	for (unsigned int i = 0; i < ARRAY_SIZE(cases); i++) {
+		fw->usb[7] = cases[i][0];
+		val.intval = INT_MIN;
+		KUNIT_EXPECT_EQ(test, qcom_battmgr_usb_get_property(psy, POWER_SUPPLY_PROP_USB_TYPE,
+								    &val), 0);
+		KUNIT_EXPECT_EQ(test, fw->last_property, 7);
+		KUNIT_EXPECT_EQ_MSG(test, val.intval, cases[i][1], "raw %#x", cases[i][0]);
+	}
+}
+
+static void battmgr_test_unregister_psy(void *psy)
+{
+	power_supply_unregister(psy);
+}
+
+static const char *battmgr_test_env(struct kobj_uevent_env *env, const char *key)
+{
+	for (int i = 0; i < env->envp_idx; i++)
+		if (str_has_prefix(env->envp[i], key))
+			return env->envp[i] + strlen(key);
+	return NULL;
+}
+
+static void battmgr_test_usb_type_sysfs(struct kunit *test)
+{
+	const struct {
+		u32 raw;
+		const char *shown;
+	} cases[] = {
+		{ 0x80, "[DCP]" }, { 0x81, "[DCP]" }, { 0x82, "[DCP]" },
+		{ 0x84, "[DCP]" }, { 0x83, "[Unknown]" }, { 1, "[SDP]" },
+	};
+	struct battmgr_fake *fw = test->priv;
+	struct qcom_battmgr *b = fw->b;
+	struct power_supply_config cfg = { .drv_data = b, .no_wakeup_source = true };
+	struct device_attribute *usb_type = NULL;
+	struct kobj_uevent_env *env;
+	struct power_supply *psy;
+	struct attribute **attr;
+	const char *value;
+	char *buf;
+
+	buf = kunit_kzalloc(test, PAGE_SIZE, GFP_KERNEL);
+	env = kunit_kzalloc(test, sizeof(*env), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	KUNIT_ASSERT_NOT_NULL(test, env);
+
+	/* Registration uevents run on other threads: keep them off the transport. */
+	WRITE_ONCE(b->service_up, false);
+	psy = power_supply_register(fw->dev, &sm8475_usb_psy_desc, &cfg);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, psy);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, battmgr_test_unregister_psy, psy), 0);
+	flush_delayed_work(&psy->deferred_register_work);
+	flush_work(&psy->changed_work);
+	WRITE_ONCE(b->service_up, true);
+
+	for (attr = power_supply_attr_groups[0]->attrs; *attr; attr++)
+		if (!strcmp((*attr)->name, "usb_type"))
+			usb_type = container_of(*attr, struct device_attribute, attr);
+	KUNIT_ASSERT_NOT_NULL(test, usb_type);
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(cases); i++) {
+		fw->usb[7] = cases[i].raw;
+
+		/* The usb_type attribute itself, as userspace reads it. */
+		memset(buf, 0, PAGE_SIZE);
+		KUNIT_EXPECT_GT_MSG(test, usb_type->show(&psy->dev, usb_type, buf), 0,
+				    "raw %#x", cases[i].raw);
+		KUNIT_EXPECT_NOT_NULL_MSG(test, strstr(buf, cases[i].shown), "raw %#x: %s",
+					  cases[i].raw, buf);
+
+		/* The change uevent carries it. */
+		memset(env, 0, sizeof(*env));
+		KUNIT_EXPECT_EQ(test, power_supply_uevent(&psy->dev, env), 0);
+		value = battmgr_test_env(env, "POWER_SUPPLY_USB_TYPE=");
+		KUNIT_EXPECT_NOT_NULL_MSG(test, value, "raw %#x", cases[i].raw);
+		if (value)
+			KUNIT_EXPECT_NOT_NULL_MSG(test, strstr(value, cases[i].shown),
+						  "raw %#x: %s", cases[i].raw, value);
+		KUNIT_EXPECT_NOT_NULL(test, battmgr_test_env(env, "POWER_SUPPLY_ONLINE="));
+	}
+}
+
 static struct kunit_case qcom_battmgr_test_cases[] = {
 	KUNIT_CASE(battmgr_test_property_ids),
 	KUNIT_CASE(battmgr_test_refresh),
@@ -727,6 +842,8 @@ static struct kunit_case qcom_battmgr_test_cases[] = {
 	KUNIT_CASE(battmgr_test_wake_session),
 	KUNIT_CASE(battmgr_test_icl_set),
 	KUNIT_CASE(battmgr_test_icl_default),
+	KUNIT_CASE(battmgr_test_usb_type_values),
+	KUNIT_CASE(battmgr_test_usb_type_sysfs),
 	{}
 };
 

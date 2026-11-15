@@ -216,15 +216,15 @@ config BATTERY_QCOM_BATTMGR
 
 config BATTERY_QCOM_BATTMGR_KUNIT_TEST
 	bool "KUnit tests for the Qualcomm PMIC GLINK battery manager" if !KUNIT_ALL_TESTS
-	depends on BATTERY_QCOM_BATTMGR && KUNIT
-	depends on KUNIT=y || BATTERY_QCOM_BATTMGR=m
+	depends on BATTERY_QCOM_BATTMGR=y && KUNIT=y
 	default KUNIT_ALL_TESTS
 	help
 	  Build KUnit tests for the SM8475 property protocol into the driver:
 	  the firmware property ids, the battery units, the fuel-gauge
 	  refresh, the vendor change event, the USB input current limit and
-	  the wired-charging wakeup source classification. The tests replace
-	  the GLINK transport with a fake firmware and need no hardware.
+	  type, and the wired-charging wakeup source classification. The tests
+	  replace the GLINK transport with a fake firmware and need no
+	  hardware.
 
 	  If unsure, say N.
 

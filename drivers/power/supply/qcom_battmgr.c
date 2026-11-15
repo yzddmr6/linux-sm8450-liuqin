@@ -101,6 +101,10 @@ enum qcom_battmgr_variant {
 #define SM8475_USB_ADAP_SDP		1
 #define SM8475_USB_ADAP_CDP		3
 #define SM8475_USB_ADAP_PD		6
+#define SM8475_USB_ADAP_HVDCP		0x80
+#define SM8475_USB_ADAP_HVDCP_3		0x81
+#define SM8475_USB_ADAP_HVDCP_3P5	0x82
+#define SM8475_USB_ADAP_HVDCP_3_CLASSB	0x84
 
 /*
  * Stock passes the USB stack's VBUS budget on as the input current limit.
@@ -1768,6 +1772,28 @@ static int qcom_battmgr_sm8475_usb_property_is_writeable(struct power_supply *ps
 	return psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT;
 }
 
+/*
+ * The class only knows the power_supply_usb_type values, and SM8475 also
+ * reports the QTI dedicated-charger types from 0x80. Stock
+ * battery_chg_update_usb_type_work() supplies HVDCP, HVDCP_3 and HVDCP_3P5
+ * as a DCP; HVDCP_3 class B is the same QC charger family. Any other value is
+ * unknown, as in stock's default case, so reading usb_type never fails.
+ */
+static int qcom_battmgr_sm8475_usb_type(u32 type)
+{
+	switch (type) {
+	case SM8475_USB_ADAP_HVDCP:
+	case SM8475_USB_ADAP_HVDCP_3:
+	case SM8475_USB_ADAP_HVDCP_3P5:
+	case SM8475_USB_ADAP_HVDCP_3_CLASSB:
+		return POWER_SUPPLY_USB_TYPE_DCP;
+	}
+
+	/* Up to the Apple brick ID the firmware uses the class numbering. */
+	return type <= POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID ? type :
+	       POWER_SUPPLY_USB_TYPE_UNKNOWN;
+}
+
 static int qcom_battmgr_usb_get_property(struct power_supply *psy,
 					 enum power_supply_property psp,
 					 union power_supply_propval *val)
@@ -1806,6 +1832,8 @@ static int qcom_battmgr_usb_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_USB_TYPE:
 		val->intval = battmgr->usb.usb_type;
+		if (battmgr->variant == QCOM_BATTMGR_SM8475)
+			val->intval = qcom_battmgr_sm8475_usb_type(val->intval);
 		break;
 	default:
 		return -EINVAL;
