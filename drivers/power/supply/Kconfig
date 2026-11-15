@@ -222,9 +222,9 @@ config BATTERY_QCOM_BATTMGR_KUNIT_TEST
 	help
 	  Build KUnit tests for the SM8475 property protocol into the driver:
 	  the firmware property ids, the battery units, the fuel-gauge
-	  refresh, the vendor change event and the wired-charging wakeup
-	  source classification. The tests replace the GLINK transport with a
-	  fake firmware and need no hardware.
+	  refresh, the vendor change event, the USB input current limit and
+	  the wired-charging wakeup source classification. The tests replace
+	  the GLINK transport with a fake firmware and need no hardware.
 
 	  If unsure, say N.
 

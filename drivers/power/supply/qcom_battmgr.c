@@ -100,6 +100,17 @@ enum qcom_battmgr_variant {
  */
 #define SM8475_USB_ADAP_SDP		1
 #define SM8475_USB_ADAP_CDP		3
+#define SM8475_USB_ADAP_PD		6
+
+/*
+ * Stock passes the USB stack's VBUS budget on as the input current limit.
+ * Without enumeration the charger firmware holds an SDP at 100 mA, so take
+ * the USB 2.0 configured-device 500 mA from the kernel itself; the charger's
+ * AICL backs off on a port that cannot supply it.
+ */
+#define SM8475_SDP_ICL_UA		500000
+/* USB disconnect (0 mA) and suspend (2 mA) budgets never lower the limit. */
+#define SM8475_ICL_IGNORE_UA		2000
 
 #define BATTMGR_XM_PROPERTY_GET		0x50
 #define BATTMGR_XM_PROPERTY_SET		0x51
@@ -458,6 +469,10 @@ struct qcom_battmgr {
 	spinlock_t charge_lock;
 	bool charge_awake;
 
+	/* Host-side USB input current limit of this SDP/PD attach; 0 = none. */
+	u32 usb_icl_ua;
+	int usb_icl_generation;
+
 	/*
 	 * @lock is used to prevent concurrent power supply requests to the
 	 * firmware, as it then stops responding.
@@ -480,6 +495,8 @@ static int qcom_battmgr_xm_transact_locked(struct qcom_battmgr *battmgr,
 	if (opcode != BATTMGR_XM_PROPERTY_GET &&
 	    opcode != BATTMGR_XM_PROPERTY_SET &&
 	    !(opcode == BATTMGR_BAT_PROPERTY_SET && property == BATT_CHG_CTRL_LIM &&
+	      kind == QCOM_BATTMGR_XM_VALUE_RESPONSE) &&
+	    !(opcode == BATTMGR_USB_PROPERTY_SET && property == USB_INPUT_CURR_LIMIT &&
 	      kind == QCOM_BATTMGR_XM_VALUE_RESPONSE))
 		return -EINVAL;
 
@@ -1684,6 +1701,73 @@ static int qcom_battmgr_usb_sm8350_update(struct qcom_battmgr *battmgr,
 	return ret;
 }
 
+static bool qcom_battmgr_usb_icl_valid(struct qcom_battmgr *b)
+{
+	return b->usb_icl_ua &&
+	       b->usb_icl_generation == atomic_read(&b->service_generation);
+}
+
+/* The caller has checked that the source takes a host-side limit. */
+static int qcom_battmgr_usb_write_icl_locked(struct qcom_battmgr *b, u32 ua)
+{
+	int generation = atomic_read(&b->service_generation);
+	int ret;
+
+	lockdep_assert_held(&b->lock);
+	ret = qcom_battmgr_xm_request_locked(b, BATTMGR_USB_PROPERTY_SET,
+					     USB_INPUT_CURR_LIMIT, ua, NULL,
+					     QCOM_BATTMGR_XM_VALUE_RESPONSE,
+					     NULL, NULL);
+	if (!ret) {
+		b->usb_icl_ua = ua;
+		b->usb_icl_generation = generation;
+	}
+	return ret;
+}
+
+/*
+ * Stock usb_psy_set_icl(): only an SDP or a PD source takes a host-side
+ * input current limit, and a negative request lifts it (UINT_MAX).
+ */
+static int qcom_battmgr_usb_set_icl(struct qcom_battmgr *b, int ua)
+{
+	u32 type;
+	int ret;
+
+	/* As the stock PHY on a live cable, disconnect and suspend draws keep it. */
+	if (ua >= 0 && ua <= SM8475_ICL_IGNORE_UA)
+		return 0;
+	if (!READ_ONCE(b->service_up))
+		return -EAGAIN;
+
+	guard(mutex)(&b->lock);
+	ret = qcom_battmgr_request_property(b, BATTMGR_USB_PROPERTY_GET, USB_ADAP_TYPE, 0);
+	if (ret)
+		return ret < 0 ? ret : -EREMOTEIO;
+	type = b->usb.usb_type;
+	if (type != SM8475_USB_ADAP_SDP && type != SM8475_USB_ADAP_PD)
+		return -EINVAL;
+
+	return qcom_battmgr_usb_write_icl_locked(b, ua < 0 ? UINT_MAX : ua);
+}
+
+static int qcom_battmgr_sm8475_usb_set_property(struct power_supply *psy,
+						enum power_supply_property psp,
+						const union power_supply_propval *val)
+{
+	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
+
+	if (psp != POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT)
+		return -EINVAL;
+	return qcom_battmgr_usb_set_icl(battmgr, val->intval);
+}
+
+static int qcom_battmgr_sm8475_usb_property_is_writeable(struct power_supply *psy,
+							 enum power_supply_property psp)
+{
+	return psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT;
+}
+
 static int qcom_battmgr_usb_get_property(struct power_supply *psy,
 					 enum power_supply_property psp,
 					 union power_supply_propval *val)
@@ -1768,6 +1852,27 @@ static const struct power_supply_desc sm8350_usb_psy_desc = {
 	.properties = sm8350_usb_props,
 	.num_properties = ARRAY_SIZE(sm8350_usb_props),
 	.get_property = qcom_battmgr_usb_get_property,
+	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN) |
+		     BIT(POWER_SUPPLY_USB_TYPE_SDP)     |
+		     BIT(POWER_SUPPLY_USB_TYPE_DCP)     |
+		     BIT(POWER_SUPPLY_USB_TYPE_CDP)     |
+		     BIT(POWER_SUPPLY_USB_TYPE_ACA)     |
+		     BIT(POWER_SUPPLY_USB_TYPE_C)       |
+		     BIT(POWER_SUPPLY_USB_TYPE_PD)      |
+		     BIT(POWER_SUPPLY_USB_TYPE_PD_DRP)  |
+		     BIT(POWER_SUPPLY_USB_TYPE_PD_PPS)  |
+		     BIT(POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID),
+};
+
+/* As SM8350, plus the writable input current limit of qti_battery_charger. */
+static const struct power_supply_desc sm8475_usb_psy_desc = {
+	.name = "qcom-battmgr-usb",
+	.type = POWER_SUPPLY_TYPE_USB,
+	.properties = sm8350_usb_props,
+	.num_properties = ARRAY_SIZE(sm8350_usb_props),
+	.get_property = qcom_battmgr_usb_get_property,
+	.set_property = qcom_battmgr_sm8475_usb_set_property,
+	.property_is_writeable = qcom_battmgr_sm8475_usb_property_is_writeable,
 	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN) |
 		     BIT(POWER_SUPPLY_USB_TYPE_SDP)     |
 		     BIT(POWER_SUPPLY_USB_TYPE_DCP)     |
@@ -1923,14 +2028,26 @@ static void qcom_battmgr_charge_wake(struct qcom_battmgr *b, bool online, u32 ty
 }
 
 /* Decide on this response pair, never on cached online or type telemetry. */
-static void qcom_battmgr_charge_check_locked(struct qcom_battmgr *b, bool online)
+static void qcom_battmgr_sm8475_usb_check_locked(struct qcom_battmgr *b, bool online)
 {
 	u32 type = 0;
+	int ret;
 
 	lockdep_assert_held(&b->lock);
 	if (online && !qcom_battmgr_request_property(b, BATTMGR_USB_PROPERTY_GET,
 						    USB_ADAP_TYPE, 0))
 		type = b->usb.usb_type;
+
+	/* Stock forgets the host-side limit once the source is no SDP or PD. */
+	if (type != SM8475_USB_ADAP_SDP && type != SM8475_USB_ADAP_PD) {
+		b->usb_icl_ua = 0;
+	} else if (type == SM8475_USB_ADAP_SDP && !qcom_battmgr_usb_icl_valid(b)) {
+		ret = qcom_battmgr_usb_write_icl_locked(b, SM8475_SDP_ICL_UA);
+		if (ret)
+			dev_warn_ratelimited(b->dev, "SDP input current limit not set: %d\n",
+					     ret);
+	}
+
 	qcom_battmgr_charge_wake(b, online, type);
 }
 
@@ -1958,8 +2075,8 @@ static void qcom_battmgr_check_online(struct work_struct *work)
 		if (pending & BIT(ONLINE_USB)) {
 			ret = qcom_battmgr_request_property(b, BATTMGR_USB_PROPERTY_GET,
 							    USB_ONLINE, 0);
-			if (b->charge_ws)
-				qcom_battmgr_charge_check_locked(b, !ret && b->usb.online);
+			if (b->variant == QCOM_BATTMGR_SM8475)
+				qcom_battmgr_sm8475_usb_check_locked(b, !ret && b->usb.online);
 		}
 		if (pending & BIT(ONLINE_WIRELESS))
 			qcom_battmgr_request_property(b, BATTMGR_WLS_PROPERTY_GET, WLS_ONLINE, 0);
@@ -2520,7 +2637,8 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
 	/* XM must never reach the generic, broad completion path. */
 	if (opcode == BATTMGR_XM_PROPERTY_GET || opcode == BATTMGR_XM_PROPERTY_SET ||
 	    (battmgr->variant == QCOM_BATTMGR_SM8475 &&
-	     opcode == BATTMGR_BAT_PROPERTY_SET)) {
+	     (opcode == BATTMGR_BAT_PROPERTY_SET ||
+	      opcode == BATTMGR_USB_PROPERTY_SET))) {
 		dev_warn_ratelimited(battmgr->dev,
 				     "unsolicited XM response %#x ignored\n", opcode);
 		return;
@@ -2807,7 +2925,11 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 			return dev_err_probe(dev, PTR_ERR(battmgr->bat_psy),
 					     "failed to register battery power supply\n");
 
-		battmgr->usb_psy = devm_power_supply_register(dev, &sm8350_usb_psy_desc, &psy_cfg_supply);
+		if (battmgr->variant == QCOM_BATTMGR_SM8475)
+			psy_desc = &sm8475_usb_psy_desc;
+		else
+			psy_desc = &sm8350_usb_psy_desc;
+		battmgr->usb_psy = devm_power_supply_register(dev, psy_desc, &psy_cfg_supply);
 		if (IS_ERR(battmgr->usb_psy))
 			return dev_err_probe(dev, PTR_ERR(battmgr->usb_psy),
 					     "failed to register USB power supply\n");

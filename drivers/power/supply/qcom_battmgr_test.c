@@ -14,6 +14,7 @@
  * b13b976e8a0d5ce2256df4f96368a6de0999aecf4dd311a9ded0f993e2cedf6b, from the
  * ROM whose ADSP firmware the liuqin images ship). Battery readings are the
  * liuqin stock-sysfs units recorded by the liuqin-nixos telemetry test.
+ * The input current limit follows stock usb_psy_set_icl() and the stock PHY.
  */
 #include <kunit/device.h>
 #include <kunit/static_stub.h>
@@ -29,6 +30,8 @@ struct battmgr_fake {
 	int transport_error;	/* returned without any reply */
 	u32 fail_opcode;	/* answered with a non-zero result */
 	u32 fail_property;
+	unsigned int sets;	/* USB property SET requests */
+	u32 set_value;
 	u32 bat[32];		/* indexed by firmware battery property id */
 	u32 usb[16];
 	u32 xm[256];
@@ -79,6 +82,10 @@ static int battmgr_fake_request(struct qcom_battmgr *battmgr, void *data, size_t
 	case BATTMGR_XM_PROPERTY_GET:
 		if (property < ARRAY_SIZE(fw->xm))
 			value = fw->xm[property];
+		break;
+	case BATTMGR_USB_PROPERTY_SET:
+		fw->sets++;
+		fw->set_value = le32_to_cpu(req->value);
 		break;
 	}
 
@@ -561,6 +568,155 @@ static void battmgr_test_wake_session(struct kunit *test)
 	KUNIT_EXPECT_GT(test, b->charge_ws->active_count, 0);
 }
 
+static int battmgr_test_set_icl(struct kunit *test, int ua)
+{
+	struct battmgr_fake *fw = test->priv;
+	struct power_supply *psy = kunit_kzalloc(test, sizeof(*psy), GFP_KERNEL);
+	union power_supply_propval val = { .intval = ua };
+
+	KUNIT_ASSERT_NOT_NULL(test, psy);
+	psy->drv_data = fw->b;
+	return qcom_battmgr_sm8475_usb_set_property(psy, POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
+						    &val);
+}
+
+static void battmgr_test_icl_set(struct kunit *test)
+{
+	struct battmgr_fake *fw = test->priv;
+	struct qcom_battmgr *b = fw->b;
+
+	KUNIT_EXPECT_TRUE(test, qcom_battmgr_sm8475_usb_property_is_writeable(NULL,
+				POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT));
+	KUNIT_EXPECT_FALSE(test, qcom_battmgr_sm8475_usb_property_is_writeable(NULL,
+				POWER_SUPPLY_PROP_ONLINE));
+	KUNIT_EXPECT_FALSE(test, qcom_battmgr_sm8475_usb_property_is_writeable(NULL,
+				POWER_SUPPLY_PROP_CURRENT_MAX));
+
+	/* SDP: the type is read for this request, then USB_INPUT_CURR_LIMIT set. */
+	fw->usb[7] = 1;
+	KUNIT_EXPECT_EQ(test, battmgr_test_set_icl(test, 500000), 0);
+	KUNIT_ASSERT_EQ(test, fw->requests, 2);
+	KUNIT_EXPECT_EQ(test, fw->log[0][0], 0x32);
+	KUNIT_EXPECT_EQ(test, fw->log[0][1], 7);
+	KUNIT_EXPECT_EQ(test, fw->log[1][0], 0x33);
+	KUNIT_EXPECT_EQ(test, fw->log[1][1], 5);
+	KUNIT_EXPECT_EQ(test, fw->set_value, 500000);
+	KUNIT_EXPECT_EQ(test, b->usb_icl_ua, 500000);
+
+	/* An explicit lower request is honoured (host-port A/B). */
+	KUNIT_EXPECT_EQ(test, battmgr_test_set_icl(test, 100000), 0);
+	KUNIT_EXPECT_EQ(test, fw->set_value, 100000);
+
+	/* PD takes it too. */
+	fw->usb[7] = 6;
+	KUNIT_EXPECT_EQ(test, battmgr_test_set_icl(test, 1500000), 0);
+	KUNIT_EXPECT_EQ(test, fw->set_value, 1500000);
+
+	/* Negative lifts the limit. */
+	fw->usb[7] = 1;
+	KUNIT_EXPECT_EQ(test, battmgr_test_set_icl(test, -1), 0);
+	KUNIT_EXPECT_EQ(test, fw->set_value, UINT_MAX);
+	KUNIT_EXPECT_EQ(test, b->usb_icl_ua, UINT_MAX);
+
+	/* 0 and 2 mA (USB disconnect, suspend) change nothing. */
+	KUNIT_EXPECT_EQ(test, battmgr_test_set_icl(test, 500000), 0);
+	fw->requests = 0;
+	KUNIT_EXPECT_EQ(test, battmgr_test_set_icl(test, 0), 0);
+	KUNIT_EXPECT_EQ(test, battmgr_test_set_icl(test, 2000), 0);
+	KUNIT_EXPECT_EQ(test, fw->requests, 0);
+	KUNIT_EXPECT_EQ(test, b->usb_icl_ua, 500000);
+
+	/* Any other source refuses, without a write. */
+	for (u32 type = 0; type <= 0x84; type++) {
+		if (type == 1 || type == 6 || (type > 10 && type < 0x80))
+			continue;
+		fw->usb[7] = type;
+		fw->sets = 0;
+		KUNIT_EXPECT_EQ_MSG(test, battmgr_test_set_icl(test, 500000), -EINVAL,
+				    "type %#x", type);
+		KUNIT_EXPECT_EQ_MSG(test, fw->sets, 0, "type %#x", type);
+	}
+
+	/* Firmware errors and an unreadable type are errors, not successes. */
+	fw->usb[7] = 1;
+	fw->fail_opcode = 0x33;
+	fw->fail_property = 5;
+	KUNIT_EXPECT_EQ(test, battmgr_test_set_icl(test, 900000), -EREMOTEIO);
+	KUNIT_EXPECT_EQ(test, b->usb_icl_ua, 500000);
+	fw->fail_opcode = 0x32;
+	fw->fail_property = 7;
+	KUNIT_EXPECT_EQ(test, battmgr_test_set_icl(test, 900000), -EREMOTEIO);
+	fw->fail_opcode = 0;
+	fw->transport_error = -ETIMEDOUT;
+	KUNIT_EXPECT_EQ(test, battmgr_test_set_icl(test, 900000), -ETIMEDOUT);
+	fw->transport_error = 0;
+	WRITE_ONCE(b->service_up, false);
+	fw->requests = 0;
+	KUNIT_EXPECT_EQ(test, battmgr_test_set_icl(test, 900000), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, fw->requests, 0);
+}
+
+static void battmgr_test_icl_default(struct kunit *test)
+{
+	struct battmgr_fake *fw = test->priv;
+	struct qcom_battmgr *b = fw->b;
+
+	/* SDP attach: 500 mA from the kernel, no enumeration needed. */
+	battmgr_test_usb_event(test, 1, 1);
+	KUNIT_ASSERT_EQ(test, fw->requests, 3);
+	KUNIT_EXPECT_EQ(test, fw->log[2][0], 0x33);
+	KUNIT_EXPECT_EQ(test, fw->log[2][1], 5);
+	KUNIT_EXPECT_EQ(test, fw->set_value, 500000);
+	KUNIT_EXPECT_EQ(test, b->usb_icl_ua, 500000);
+
+	/* Once per attach: later notifications do not rewrite it. */
+	battmgr_test_usb_event(test, 1, 1);
+	KUNIT_EXPECT_EQ(test, fw->requests, 2);
+
+	/* An explicit value stays for the attach. */
+	KUNIT_EXPECT_EQ(test, battmgr_test_set_icl(test, 100000), 0);
+	battmgr_test_usb_event(test, 1, 1);
+	KUNIT_EXPECT_EQ(test, fw->requests, 2);
+	KUNIT_EXPECT_EQ(test, b->usb_icl_ua, 100000);
+
+	/* Unplug forgets it; the next SDP gets the default, which 0 mA keeps. */
+	battmgr_test_usb_event(test, 0, 0);
+	KUNIT_EXPECT_EQ(test, b->usb_icl_ua, 0);
+	battmgr_test_usb_event(test, 1, 1);
+	KUNIT_EXPECT_EQ(test, fw->set_value, 500000);
+	fw->requests = 0;
+	KUNIT_EXPECT_EQ(test, battmgr_test_set_icl(test, 0), 0);
+	KUNIT_EXPECT_EQ(test, fw->requests, 0);
+	KUNIT_EXPECT_EQ(test, b->usb_icl_ua, 500000);
+
+	/* Other sources keep the firmware's own limit; PD only on request. */
+	fw->sets = 0;
+	battmgr_test_usb_event(test, 1, 2);
+	battmgr_test_usb_event(test, 1, 3);
+	battmgr_test_usb_event(test, 1, 6);
+	battmgr_test_usb_event(test, 1, 0x81);
+	KUNIT_EXPECT_EQ(test, fw->sets, 0);
+
+	/* After a charger service restart the default is set again. */
+	battmgr_test_usb_event(test, 1, 1);
+	KUNIT_EXPECT_EQ(test, fw->sets, 1);
+	qcom_battmgr_pdr_notify(b, SERVREG_SERVICE_STATE_DOWN);
+	WRITE_ONCE(b->service_up, true);
+	battmgr_test_usb_event(test, 1, 1);
+	KUNIT_EXPECT_EQ(test, fw->sets, 2);
+	KUNIT_EXPECT_EQ(test, fw->set_value, 500000);
+
+	/* A refused write is retried on the next notification. */
+	battmgr_test_usb_event(test, 0, 0);
+	fw->fail_opcode = 0x33;
+	fw->fail_property = 5;
+	battmgr_test_usb_event(test, 1, 1);
+	KUNIT_EXPECT_EQ(test, b->usb_icl_ua, 0);
+	fw->fail_opcode = 0;
+	battmgr_test_usb_event(test, 1, 1);
+	KUNIT_EXPECT_EQ(test, b->usb_icl_ua, 500000);
+}
+
 static struct kunit_case qcom_battmgr_test_cases[] = {
 	KUNIT_CASE(battmgr_test_property_ids),
 	KUNIT_CASE(battmgr_test_refresh),
@@ -569,6 +725,8 @@ static struct kunit_case qcom_battmgr_test_cases[] = {
 	KUNIT_CASE(battmgr_test_units),
 	KUNIT_CASE(battmgr_test_wake_matrix),
 	KUNIT_CASE(battmgr_test_wake_session),
+	KUNIT_CASE(battmgr_test_icl_set),
+	KUNIT_CASE(battmgr_test_icl_default),
 	{}
 };
 
