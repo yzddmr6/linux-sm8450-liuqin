@@ -91,6 +91,14 @@ enum qcom_battmgr_variant {
 #define USB_TEMP			10
 #define USB_REAL_TYPE			11
 
+/*
+ * SM8475 USB_ADAP_TYPE values follow the stock 5.10 power_supply_usb_type
+ * order (qti_battery_charger.c battery_chg_update_usb_type_work()), with the
+ * QTI HVDCP and floating types from 0x80. Only the computer ports matter here.
+ */
+#define SM8475_USB_ADAP_SDP		1
+#define SM8475_USB_ADAP_CDP		3
+
 #define BATTMGR_XM_PROPERTY_GET		0x50
 #define BATTMGR_XM_PROPERTY_SET		0x51
 #define XM_THERMAL_TEMP		86
@@ -442,6 +450,11 @@ struct qcom_battmgr {
 	bool connector_source;
 	bool connector_injected;
 	int connector_real_temp;
+
+	/* Wired-charging wakeup source; @charge_lock orders its decisions. */
+	struct wakeup_source *charge_ws;
+	spinlock_t charge_lock;
+	bool charge_awake;
 
 	/*
 	 * @lock is used to prevent concurrent power supply requests to the
@@ -1865,10 +1878,70 @@ enum battmgr_online_input {
 	ONLINE_AC,
 };
 
+/*
+ * The stock driver keeps the system awake for the whole wired session. Keep
+ * that, except on the two computer-port types: an SDP or CDP cannot cover an
+ * awake tablet, so the system must be allowed to sleep there. Unknown is a
+ * wired source whose type detection has not finished yet.
+ */
+static bool liuqin_should_stay_awake(bool online, bool otg, u32 type)
+{
+	return online && !otg && type != SM8475_USB_ADAP_SDP &&
+	       type != SM8475_USB_ADAP_CDP;
+}
+
+/* Also called from GLINK callbacks under client_lock. */
+static void qcom_battmgr_charge_wake(struct qcom_battmgr *b, bool online, u32 type)
+{
+	unsigned long flags;
+	bool awake, changed;
+
+	if (!b->charge_ws)
+		return;
+
+	spin_lock_irqsave(&b->charge_lock, flags);
+	awake = READ_ONCE(b->service_up) &&
+		liuqin_should_stay_awake(online, READ_ONCE(b->connector_source), type);
+	changed = awake != b->charge_awake;
+	if (changed) {
+		b->charge_awake = awake;
+		if (awake)
+			__pm_stay_awake(b->charge_ws);
+		else
+			__pm_relax(b->charge_ws);
+	}
+	spin_unlock_irqrestore(&b->charge_lock, flags);
+
+	/* tablet-charge-idle follows the wakeup source on power_supply uevents. */
+	if (changed && b->usb_psy)
+		power_supply_changed(b->usb_psy);
+}
+
+/* Decide on this response pair, never on cached online or type telemetry. */
+static void qcom_battmgr_charge_check_locked(struct qcom_battmgr *b, bool online)
+{
+	u32 type = 0;
+
+	lockdep_assert_held(&b->lock);
+	if (online && !qcom_battmgr_request_property(b, BATTMGR_USB_PROPERTY_GET,
+						    USB_ADAP_TYPE, 0))
+		type = b->usb.usb_type;
+	qcom_battmgr_charge_wake(b, online, type);
+}
+
+static void qcom_battmgr_charge_wake_remove(void *data)
+{
+	struct qcom_battmgr *b = data;
+
+	__pm_relax(b->charge_ws);
+	wakeup_source_unregister(b->charge_ws);
+}
+
 static void qcom_battmgr_check_online(struct work_struct *work)
 {
 	struct qcom_battmgr *b = container_of(work, struct qcom_battmgr, online_work);
 	unsigned long pending = xchg(&b->online_pending, 0);
+	int ret;
 
 	if (!READ_ONCE(b->service_up))
 		return;
@@ -1877,8 +1950,12 @@ static void qcom_battmgr_check_online(struct work_struct *work)
 	if (b->variant == QCOM_BATTMGR_SC8280XP) {
 		qcom_battmgr_update_status(b);
 	} else {
-		if (pending & BIT(ONLINE_USB))
-			qcom_battmgr_request_property(b, BATTMGR_USB_PROPERTY_GET, USB_ONLINE, 0);
+		if (pending & BIT(ONLINE_USB)) {
+			ret = qcom_battmgr_request_property(b, BATTMGR_USB_PROPERTY_GET,
+							    USB_ONLINE, 0);
+			if (b->charge_ws)
+				qcom_battmgr_charge_check_locked(b, !ret && b->usb.online);
+		}
 		if (pending & BIT(ONLINE_WIRELESS))
 			qcom_battmgr_request_property(b, BATTMGR_WLS_PROPERTY_GET, WLS_ONLINE, 0);
 	}
@@ -1914,8 +1991,14 @@ static void qcom_battmgr_source_changed(void *priv, unsigned long ports)
 {
 	struct qcom_battmgr *b = priv;
 
-	b->connector_source = ports & BIT(0);
+	WRITE_ONCE(b->connector_source, ports & BIT(0));
 	qcom_battmgr_connector_gate(b);
+
+	/* Sourcing VBUS (OTG) is no charging session: release now, recheck after. */
+	if (b->connector_source)
+		qcom_battmgr_charge_wake(b, false, 0);
+	else if (b->charge_ws)
+		qcom_battmgr_queue_online(b, ONLINE_USB);
 }
 
 /* GLINK serializes RX and service-down callbacks under client_lock. */
@@ -2618,8 +2701,9 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
 		WRITE_ONCE(battmgr->service_up, false);
 		battmgr->online_valid = 0;
 		battmgr->online_mask = 0;
-		battmgr->connector_source = false;
+		WRITE_ONCE(battmgr->connector_source, false);
 		qcom_battmgr_connector_gate(battmgr);
+		qcom_battmgr_charge_wake(battmgr, false, 0);
 		atomic_inc(&battmgr->service_generation);
 		WRITE_ONCE(battmgr->liuqin_thermal_level, -1);
 	}
@@ -2730,12 +2814,24 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	}
 
 	spin_lock_init(&battmgr->connector_lock);
+	spin_lock_init(&battmgr->charge_lock);
 	INIT_DELAYED_WORK(&battmgr->connector_work, qcom_battmgr_connector_worker);
 	if (battmgr->variant == QCOM_BATTMGR_SM8475) {
 		battmgr->connector_enabled = IS_REACHABLE(CONFIG_IIO) &&
 			device_property_match_string(dev, "io-channel-names", "connector-temp") >= 0;
 		if (!battmgr->connector_enabled && of_machine_is_compatible("xiaomi,liuqin"))
 			dev_err(dev, "connector temperature channel unavailable\n");
+
+		/* Unregistered only after devres has released the GLINK client. */
+		if (IS_ENABLED(CONFIG_PM_SLEEP)) {
+			battmgr->charge_ws = wakeup_source_register(dev, "qcom-battmgr-charge");
+			if (!battmgr->charge_ws)
+				return -ENOMEM;
+			ret = devm_add_action_or_reset(dev, qcom_battmgr_charge_wake_remove,
+						       battmgr);
+			if (ret)
+				return ret;
+		}
 	}
 
 	battmgr->client = devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_BATTMGR,
@@ -2749,8 +2845,10 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	if (ret)
 		return ret;
 
-	if (battmgr->connector_enabled) {
+	/* The connector gate and the charging wakeup source both follow OTG. */
+	if (battmgr->variant == QCOM_BATTMGR_SM8475)
 		pmic_glink_client_watch_source_ports(battmgr->client, qcom_battmgr_source_changed);
+	if (battmgr->connector_enabled) {
 		ret = devm_device_add_group(dev, &connector_test_group);
 		if (ret)
 			return ret;
