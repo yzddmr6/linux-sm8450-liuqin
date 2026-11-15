@@ -22,6 +22,8 @@
 #include <linux/units.h>
 #include <linux/overflow.h>
 
+#include <kunit/static_stub.h>
+
 #define BATTMGR_CHEMISTRY_LEN	4
 #define BATTMGR_STRING_LEN	128
 
@@ -1168,6 +1170,9 @@ static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t
 {
 	unsigned long left;
 	int ret;
+
+	/* KUnit replaces the GLINK transport here; a no-op without KUnit. */
+	KUNIT_STATIC_STUB_REDIRECT(qcom_battmgr_request, battmgr, data, len);
 
 	reinit_completion(&battmgr->ack);
 
@@ -2887,3 +2892,7 @@ module_auxiliary_driver(qcom_battmgr_driver);
 
 MODULE_DESCRIPTION("Qualcomm PMIC GLINK battery manager driver");
 MODULE_LICENSE("GPL");
+
+#if IS_ENABLED(CONFIG_BATTERY_QCOM_BATTMGR_KUNIT_TEST)
+#include "qcom_battmgr_test.c"
+#endif
