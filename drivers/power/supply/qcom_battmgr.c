@@ -14,11 +14,15 @@
 #include <linux/mutex.h>
 #include <linux/of_device.h>
 #include <linux/power_supply.h>
+#include <linux/pm.h>
 #include <linux/property.h>
 #include <linux/soc/qcom/pdr.h>
 #include <linux/soc/qcom/pmic_glink.h>
 #include <linux/math.h>
 #include <linux/units.h>
+#include <linux/overflow.h>
+
+#include <kunit/static_stub.h>
 
 #define BATTMGR_CHEMISTRY_LEN	4
 #define BATTMGR_STRING_LEN	128
@@ -89,8 +93,34 @@ enum qcom_battmgr_variant {
 #define USB_TEMP			10
 #define USB_REAL_TYPE			11
 
+/*
+ * SM8475 USB_ADAP_TYPE values follow the stock 5.10 power_supply_usb_type
+ * order (qti_battery_charger.c battery_chg_update_usb_type_work()), with the
+ * QTI HVDCP and floating types from 0x80. Only the computer ports matter here.
+ */
+#define SM8475_USB_ADAP_SDP		1
+#define SM8475_USB_ADAP_CDP		3
+#define SM8475_USB_ADAP_PD		6
+#define SM8475_USB_ADAP_HVDCP		0x80
+#define SM8475_USB_ADAP_HVDCP_3		0x81
+#define SM8475_USB_ADAP_HVDCP_3P5	0x82
+#define SM8475_USB_ADAP_HVDCP_3_CLASSB	0x84
+
+/*
+ * Stock passes the USB stack's VBUS budget on as the input current limit.
+ * Without enumeration the charger firmware holds an SDP at 100 mA, so take
+ * the USB 2.0 configured-device 500 mA from the kernel itself; the charger's
+ * AICL backs off on a port that cannot supply it.
+ */
+#define SM8475_SDP_ICL_UA		500000
+/* USB disconnect (0 mA) and suspend (2 mA) budgets never lower the limit. */
+#define SM8475_ICL_IGNORE_UA		2000
+
 #define BATTMGR_XM_PROPERTY_GET		0x50
 #define BATTMGR_XM_PROPERTY_SET		0x51
+#define XM_THERMAL_TEMP		86
+#define SM8475_REFRESH_INTERVAL	(10 * HZ)
+
 #define XM_CONNECTOR_TEMP		2
 #define XM_AUTHENTIC			3
 #define XM_REAL_TYPE			6
@@ -104,9 +134,10 @@ enum qcom_battmgr_variant {
 #define XM_PD_VERIFIED			19
 #define XM_PDO2			20
 #define XM_FASTCHG_MODE			38
-#define XM_QUICK_CHARGE_TYPE		42
-#define XM_APDO_MAX			43
-#define XM_POWER_MAX			44
+/* M81 inserts BLANK_STATUS/SCREEN_CCTOG at 40/41 before SOC_DECIMAL. */
+#define XM_QUICK_CHARGE_TYPE		44
+#define XM_APDO_MAX			45
+#define XM_POWER_MAX			46
 /* Additional XM properties used by the adapter/battery authentication path. */
 #define XM_VERIFY_DIGEST		1
 #define XM_VDM_CHARGER_VERSION		8
@@ -425,6 +456,8 @@ struct qcom_battmgr {
 	int liuqin_level_generation;
 
 	struct work_struct enable_work;
+	struct work_struct xm_notify_work;
+	struct delayed_work refresh_work;
 	struct iio_channel *connector; /* acquired by connector_work */
 	bool connector_enabled;
 	struct delayed_work connector_work;
@@ -434,6 +467,15 @@ struct qcom_battmgr {
 	bool connector_source;
 	bool connector_injected;
 	int connector_real_temp;
+
+	/* Wired-charging wakeup source; @charge_lock orders its decisions. */
+	struct wakeup_source *charge_ws;
+	spinlock_t charge_lock;
+	bool charge_awake;
+
+	/* Host-side USB input current limit of this SDP/PD attach; 0 = none. */
+	u32 usb_icl_ua;
+	int usb_icl_generation;
 
 	/*
 	 * @lock is used to prevent concurrent power supply requests to the
@@ -457,6 +499,8 @@ static int qcom_battmgr_xm_transact_locked(struct qcom_battmgr *battmgr,
 	if (opcode != BATTMGR_XM_PROPERTY_GET &&
 	    opcode != BATTMGR_XM_PROPERTY_SET &&
 	    !(opcode == BATTMGR_BAT_PROPERTY_SET && property == BATT_CHG_CTRL_LIM &&
+	      kind == QCOM_BATTMGR_XM_VALUE_RESPONSE) &&
+	    !(opcode == BATTMGR_USB_PROPERTY_SET && property == USB_INPUT_CURR_LIMIT &&
 	      kind == QCOM_BATTMGR_XM_VALUE_RESPONSE))
 		return -EINVAL;
 
@@ -1148,6 +1192,9 @@ static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t
 	unsigned long left;
 	int ret;
 
+	/* KUnit replaces the GLINK transport here; a no-op without KUnit. */
+	KUNIT_STATIC_STUB_REDIRECT(qcom_battmgr_request, battmgr, data, len);
+
 	reinit_completion(&battmgr->ack);
 
 	battmgr->error = 0;
@@ -1244,6 +1291,7 @@ static const u8 sm8350_bat_prop_map[] = {
 	[POWER_SUPPLY_PROP_CYCLE_COUNT] = BATT_CYCLE_COUNT,
 	[POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN] =  BATT_CHG_FULL_DESIGN,
 	[POWER_SUPPLY_PROP_CHARGE_FULL] = BATT_CHG_FULL,
+	[POWER_SUPPLY_PROP_CHARGE_NOW] = BATT_CHG_COUNTER,
 	[POWER_SUPPLY_PROP_MODEL_NAME] = BATT_MODEL_NAME,
 	[POWER_SUPPLY_PROP_TIME_TO_FULL_AVG] = BATT_TTF_AVG,
 	[POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG] = BATT_TTE_AVG,
@@ -1327,6 +1375,20 @@ out_unlock:
 	return ret;
 }
 
+static int qcom_battmgr_bat_charge_counter(struct qcom_battmgr *battmgr,
+					 union power_supply_propval *val)
+{
+	s32 counter = battmgr->info.charge_count;
+
+	/* Xiaomi reports the counter in mAh; full/design charge is already uAh. */
+	if (battmgr->variant == QCOM_BATTMGR_SM8475 &&
+	    check_mul_overflow(counter, MILLI, &counter))
+		return -ERANGE;
+
+	val->intval = counter;
+	return 0;
+}
+
 static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 					 enum power_supply_property psp,
 					 union power_supply_propval *val)
@@ -1337,6 +1399,17 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 
 	if (!battmgr->service_up)
 		return -EAGAIN;
+
+	if (battmgr->variant == QCOM_BATTMGR_SM8475) {
+		/* This property protocol has no BAT_INFO response to set the unit. */
+		unit = QCOM_BATTMGR_UNIT_mAh;
+
+		/* Keep firmware placeholders and unverified time units out of the ABI. */
+		if (psp == POWER_SUPPLY_PROP_POWER_NOW ||
+		    psp == POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG ||
+		    psp == POWER_SUPPLY_PROP_TIME_TO_FULL_AVG)
+			return -ENODATA;
+	}
 
 	if (battmgr->variant == QCOM_BATTMGR_SC8280XP)
 		ret = qcom_battmgr_bat_sc8280xp_update(battmgr, psp);
@@ -1403,11 +1476,12 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CHARGE_NOW:
 		if (unit != QCOM_BATTMGR_UNIT_mAh)
 			return -ENODATA;
+		if (battmgr->variant == QCOM_BATTMGR_SM8475)
+			return qcom_battmgr_bat_charge_counter(battmgr, val);
 		val->intval = battmgr->status.capacity;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
-		val->intval = battmgr->info.charge_count;
-		break;
+		return qcom_battmgr_bat_charge_counter(battmgr, val);
 	case POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN:
 		if (unit != QCOM_BATTMGR_UNIT_mWh)
 			return -ENODATA;
@@ -1531,6 +1605,39 @@ static const struct power_supply_desc sm8350_bat_psy_desc = {
 	.get_property = qcom_battmgr_bat_get_property,
 };
 
+/*
+ * Xiaomi's POWER_NOW is a fixed placeholder and its time estimates are not
+ * in verified Linux ABI units. Export measured charge/current/voltage instead;
+ * userspace can derive energy, power and runtime estimates from those.
+ */
+static const enum power_supply_property sm8475_bat_props[] = {
+	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_HEALTH,
+	POWER_SUPPLY_PROP_PRESENT,
+	POWER_SUPPLY_PROP_CHARGE_TYPE,
+	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_VOLTAGE_OCV,
+	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_VOLTAGE_MAX,
+	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_TEMP,
+	POWER_SUPPLY_PROP_TECHNOLOGY,
+	POWER_SUPPLY_PROP_CHARGE_COUNTER,
+	POWER_SUPPLY_PROP_CYCLE_COUNT,
+	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
+	POWER_SUPPLY_PROP_CHARGE_FULL,
+	POWER_SUPPLY_PROP_CHARGE_NOW,
+	POWER_SUPPLY_PROP_MODEL_NAME,
+};
+
+static const struct power_supply_desc sm8475_bat_psy_desc = {
+	.name = "qcom-battmgr-bat",
+	.type = POWER_SUPPLY_TYPE_BATTERY,
+	.properties = sm8475_bat_props,
+	.num_properties = ARRAY_SIZE(sm8475_bat_props),
+	.get_property = qcom_battmgr_bat_get_property,
+};
+
 static int qcom_battmgr_ac_get_property(struct power_supply *psy,
 					enum power_supply_property psp,
 					union power_supply_propval *val)
@@ -1598,6 +1705,95 @@ static int qcom_battmgr_usb_sm8350_update(struct qcom_battmgr *battmgr,
 	return ret;
 }
 
+static bool qcom_battmgr_usb_icl_valid(struct qcom_battmgr *b)
+{
+	return b->usb_icl_ua &&
+	       b->usb_icl_generation == atomic_read(&b->service_generation);
+}
+
+/* The caller has checked that the source takes a host-side limit. */
+static int qcom_battmgr_usb_write_icl_locked(struct qcom_battmgr *b, u32 ua)
+{
+	int generation = atomic_read(&b->service_generation);
+	int ret;
+
+	lockdep_assert_held(&b->lock);
+	ret = qcom_battmgr_xm_request_locked(b, BATTMGR_USB_PROPERTY_SET,
+					     USB_INPUT_CURR_LIMIT, ua, NULL,
+					     QCOM_BATTMGR_XM_VALUE_RESPONSE,
+					     NULL, NULL);
+	if (!ret) {
+		b->usb_icl_ua = ua;
+		b->usb_icl_generation = generation;
+	}
+	return ret;
+}
+
+/*
+ * Stock usb_psy_set_icl(): only an SDP or a PD source takes a host-side
+ * input current limit, and a negative request lifts it (UINT_MAX).
+ */
+static int qcom_battmgr_usb_set_icl(struct qcom_battmgr *b, int ua)
+{
+	u32 type;
+	int ret;
+
+	/* As the stock PHY on a live cable, disconnect and suspend draws keep it. */
+	if (ua >= 0 && ua <= SM8475_ICL_IGNORE_UA)
+		return 0;
+	if (!READ_ONCE(b->service_up))
+		return -EAGAIN;
+
+	guard(mutex)(&b->lock);
+	ret = qcom_battmgr_request_property(b, BATTMGR_USB_PROPERTY_GET, USB_ADAP_TYPE, 0);
+	if (ret)
+		return ret < 0 ? ret : -EREMOTEIO;
+	type = b->usb.usb_type;
+	if (type != SM8475_USB_ADAP_SDP && type != SM8475_USB_ADAP_PD)
+		return -EINVAL;
+
+	return qcom_battmgr_usb_write_icl_locked(b, ua < 0 ? UINT_MAX : ua);
+}
+
+static int qcom_battmgr_sm8475_usb_set_property(struct power_supply *psy,
+						enum power_supply_property psp,
+						const union power_supply_propval *val)
+{
+	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
+
+	if (psp != POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT)
+		return -EINVAL;
+	return qcom_battmgr_usb_set_icl(battmgr, val->intval);
+}
+
+static int qcom_battmgr_sm8475_usb_property_is_writeable(struct power_supply *psy,
+							 enum power_supply_property psp)
+{
+	return psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT;
+}
+
+/*
+ * The class only knows the power_supply_usb_type values, and SM8475 also
+ * reports the QTI dedicated-charger types from 0x80. Stock
+ * battery_chg_update_usb_type_work() supplies HVDCP, HVDCP_3 and HVDCP_3P5
+ * as a DCP; HVDCP_3 class B is the same QC charger family. Any other value is
+ * unknown, as in stock's default case, so reading usb_type never fails.
+ */
+static int qcom_battmgr_sm8475_usb_type(u32 type)
+{
+	switch (type) {
+	case SM8475_USB_ADAP_HVDCP:
+	case SM8475_USB_ADAP_HVDCP_3:
+	case SM8475_USB_ADAP_HVDCP_3P5:
+	case SM8475_USB_ADAP_HVDCP_3_CLASSB:
+		return POWER_SUPPLY_USB_TYPE_DCP;
+	}
+
+	/* Up to the Apple brick ID the firmware uses the class numbering. */
+	return type <= POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID ? type :
+	       POWER_SUPPLY_USB_TYPE_UNKNOWN;
+}
+
 static int qcom_battmgr_usb_get_property(struct power_supply *psy,
 					 enum power_supply_property psp,
 					 union power_supply_propval *val)
@@ -1636,6 +1832,8 @@ static int qcom_battmgr_usb_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_USB_TYPE:
 		val->intval = battmgr->usb.usb_type;
+		if (battmgr->variant == QCOM_BATTMGR_SM8475)
+			val->intval = qcom_battmgr_sm8475_usb_type(val->intval);
 		break;
 	default:
 		return -EINVAL;
@@ -1682,6 +1880,27 @@ static const struct power_supply_desc sm8350_usb_psy_desc = {
 	.properties = sm8350_usb_props,
 	.num_properties = ARRAY_SIZE(sm8350_usb_props),
 	.get_property = qcom_battmgr_usb_get_property,
+	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN) |
+		     BIT(POWER_SUPPLY_USB_TYPE_SDP)     |
+		     BIT(POWER_SUPPLY_USB_TYPE_DCP)     |
+		     BIT(POWER_SUPPLY_USB_TYPE_CDP)     |
+		     BIT(POWER_SUPPLY_USB_TYPE_ACA)     |
+		     BIT(POWER_SUPPLY_USB_TYPE_C)       |
+		     BIT(POWER_SUPPLY_USB_TYPE_PD)      |
+		     BIT(POWER_SUPPLY_USB_TYPE_PD_DRP)  |
+		     BIT(POWER_SUPPLY_USB_TYPE_PD_PPS)  |
+		     BIT(POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID),
+};
+
+/* As SM8350, plus the writable input current limit of qti_battery_charger. */
+static const struct power_supply_desc sm8475_usb_psy_desc = {
+	.name = "qcom-battmgr-usb",
+	.type = POWER_SUPPLY_TYPE_USB,
+	.properties = sm8350_usb_props,
+	.num_properties = ARRAY_SIZE(sm8350_usb_props),
+	.get_property = qcom_battmgr_usb_get_property,
+	.set_property = qcom_battmgr_sm8475_usb_set_property,
+	.property_is_writeable = qcom_battmgr_sm8475_usb_property_is_writeable,
 	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN) |
 		     BIT(POWER_SUPPLY_USB_TYPE_SDP)     |
 		     BIT(POWER_SUPPLY_USB_TYPE_DCP)     |
@@ -1797,10 +2016,82 @@ enum battmgr_online_input {
 	ONLINE_AC,
 };
 
+/*
+ * The stock driver keeps the system awake for the whole wired session. Keep
+ * that, except on the two computer-port types: an SDP or CDP cannot cover an
+ * awake tablet, so the system must be allowed to sleep there. Unknown is a
+ * wired source whose type detection has not finished yet.
+ */
+static bool liuqin_should_stay_awake(bool online, bool otg, u32 type)
+{
+	return online && !otg && type != SM8475_USB_ADAP_SDP &&
+	       type != SM8475_USB_ADAP_CDP;
+}
+
+/* Also called from GLINK callbacks under client_lock. */
+static void qcom_battmgr_charge_wake(struct qcom_battmgr *b, bool online, u32 type)
+{
+	unsigned long flags;
+	bool awake, changed;
+
+	if (!b->charge_ws)
+		return;
+
+	spin_lock_irqsave(&b->charge_lock, flags);
+	awake = READ_ONCE(b->service_up) &&
+		liuqin_should_stay_awake(online, READ_ONCE(b->connector_source), type);
+	changed = awake != b->charge_awake;
+	if (changed) {
+		b->charge_awake = awake;
+		if (awake)
+			__pm_stay_awake(b->charge_ws);
+		else
+			__pm_relax(b->charge_ws);
+	}
+	spin_unlock_irqrestore(&b->charge_lock, flags);
+
+	/* tablet-charge-idle follows the wakeup source on power_supply uevents. */
+	if (changed && b->usb_psy)
+		power_supply_changed(b->usb_psy);
+}
+
+/* Decide on this response pair, never on cached online or type telemetry. */
+static void qcom_battmgr_sm8475_usb_check_locked(struct qcom_battmgr *b, bool online)
+{
+	u32 type = 0;
+	int ret;
+
+	lockdep_assert_held(&b->lock);
+	if (online && !qcom_battmgr_request_property(b, BATTMGR_USB_PROPERTY_GET,
+						    USB_ADAP_TYPE, 0))
+		type = b->usb.usb_type;
+
+	/* Stock forgets the host-side limit once the source is no SDP or PD. */
+	if (type != SM8475_USB_ADAP_SDP && type != SM8475_USB_ADAP_PD) {
+		b->usb_icl_ua = 0;
+	} else if (type == SM8475_USB_ADAP_SDP && !qcom_battmgr_usb_icl_valid(b)) {
+		ret = qcom_battmgr_usb_write_icl_locked(b, SM8475_SDP_ICL_UA);
+		if (ret)
+			dev_warn_ratelimited(b->dev, "SDP input current limit not set: %d\n",
+					     ret);
+	}
+
+	qcom_battmgr_charge_wake(b, online, type);
+}
+
+static void qcom_battmgr_charge_wake_remove(void *data)
+{
+	struct qcom_battmgr *b = data;
+
+	__pm_relax(b->charge_ws);
+	wakeup_source_unregister(b->charge_ws);
+}
+
 static void qcom_battmgr_check_online(struct work_struct *work)
 {
 	struct qcom_battmgr *b = container_of(work, struct qcom_battmgr, online_work);
 	unsigned long pending = xchg(&b->online_pending, 0);
+	int ret;
 
 	if (!READ_ONCE(b->service_up))
 		return;
@@ -1809,8 +2100,12 @@ static void qcom_battmgr_check_online(struct work_struct *work)
 	if (b->variant == QCOM_BATTMGR_SC8280XP) {
 		qcom_battmgr_update_status(b);
 	} else {
-		if (pending & BIT(ONLINE_USB))
-			qcom_battmgr_request_property(b, BATTMGR_USB_PROPERTY_GET, USB_ONLINE, 0);
+		if (pending & BIT(ONLINE_USB)) {
+			ret = qcom_battmgr_request_property(b, BATTMGR_USB_PROPERTY_GET,
+							    USB_ONLINE, 0);
+			if (b->variant == QCOM_BATTMGR_SM8475)
+				qcom_battmgr_sm8475_usb_check_locked(b, !ret && b->usb.online);
+		}
 		if (pending & BIT(ONLINE_WIRELESS))
 			qcom_battmgr_request_property(b, BATTMGR_WLS_PROPERTY_GET, WLS_ONLINE, 0);
 	}
@@ -1846,8 +2141,14 @@ static void qcom_battmgr_source_changed(void *priv, unsigned long ports)
 {
 	struct qcom_battmgr *b = priv;
 
-	b->connector_source = ports & BIT(0);
+	WRITE_ONCE(b->connector_source, ports & BIT(0));
 	qcom_battmgr_connector_gate(b);
+
+	/* Sourcing VBUS (OTG) is no charging session: release now, recheck after. */
+	if (b->connector_source)
+		qcom_battmgr_charge_wake(b, false, 0);
+	else if (b->charge_ws)
+		qcom_battmgr_queue_online(b, ONLINE_USB);
 }
 
 /* GLINK serializes RX and service-down callbacks under client_lock. */
@@ -1859,6 +2160,15 @@ static void qcom_battmgr_online_response(struct qcom_battmgr *b, u8 mask, u8 onl
 	b->online_mask = (b->online_mask & ~mask) | online;
 	b->online_valid |= mask;
 	qcom_battmgr_connector_gate(b);
+}
+
+/* Like the OEM xm_prop_change_work, publish vendor state outside GLINK RX. */
+static void qcom_battmgr_xm_notify_worker(struct work_struct *work)
+{
+	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr,
+						 xm_notify_work);
+
+	kobject_uevent(&battmgr->dev->kobj, KOBJ_CHANGE);
 }
 
 static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
@@ -1894,8 +2204,10 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 		power_supply_changed(battmgr->wls_psy);
 		break;
 	case NOTIF_XM_PROPERTY:
-		if (battmgr->variant == QCOM_BATTMGR_SM8475)
+		if (battmgr->variant == QCOM_BATTMGR_SM8475) {
+			schedule_work(&battmgr->xm_notify_work);
 			break;
+		}
 		fallthrough;
 	default:
 		dev_err(battmgr->dev, "unknown notification: %#x\n", notification);
@@ -2353,7 +2665,8 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
 	/* XM must never reach the generic, broad completion path. */
 	if (opcode == BATTMGR_XM_PROPERTY_GET || opcode == BATTMGR_XM_PROPERTY_SET ||
 	    (battmgr->variant == QCOM_BATTMGR_SM8475 &&
-	     opcode == BATTMGR_BAT_PROPERTY_SET)) {
+	     (opcode == BATTMGR_BAT_PROPERTY_SET ||
+	      opcode == BATTMGR_USB_PROPERTY_SET))) {
 		dev_warn_ratelimited(battmgr->dev,
 				     "unsolicited XM response %#x ignored\n", opcode);
 		return;
@@ -2465,10 +2778,49 @@ static void qcom_battmgr_stop_workers(void *data)
 
 	disable_work_sync(&b->online_work);
 	disable_work_sync(&b->enable_work);
+	/* A disabled work cannot be requeued by a late RX before the client goes. */
+	disable_work_sync(&b->xm_notify_work);
 	disable_delayed_work_sync(&b->connector_work);
+	/* Cancel the refresher before devres releases its GLINK client. */
+	disable_delayed_work_sync(&b->refresh_work);
 	if (IS_REACHABLE(CONFIG_IIO) && b->connector)
 		iio_channel_release(b->connector);
 }
+
+/*
+ * M81 firmware refreshes its fuel-gauge snapshot when XM_THERMAL_TEMP is
+ * read. Ordinary BATT_* reads alone leave SOC, charge counter and temperature
+ * stale. The stock M81 driver issues this request every 10/20 seconds.
+ * Firmware subsequently reports the refreshed snapshot with notification 0x80.
+ */
+static void qcom_battmgr_sm8475_refresh_worker(struct work_struct *work)
+{
+	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
+						struct qcom_battmgr, refresh_work);
+	u32 temperature;
+	int ret;
+
+	if (READ_ONCE(battmgr->service_up)) {
+		ret = qcom_battmgr_xm_get(battmgr, XM_THERMAL_TEMP, &temperature);
+		if (ret)
+			dev_dbg(battmgr->dev, "fuel-gauge refresh failed: %d\n", ret);
+	}
+
+	queue_delayed_work(system_freezable_wq, &battmgr->refresh_work,
+			   SM8475_REFRESH_INTERVAL);
+}
+
+static int qcom_battmgr_resume(struct device *dev)
+{
+	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+
+	if (battmgr->variant == QCOM_BATTMGR_SM8475)
+		mod_delayed_work(system_freezable_wq, &battmgr->refresh_work, 0);
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(qcom_battmgr_pm_ops, NULL, qcom_battmgr_resume);
 
 static void qcom_battmgr_enable_worker(struct work_struct *work)
 {
@@ -2500,8 +2852,9 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
 		WRITE_ONCE(battmgr->service_up, false);
 		battmgr->online_valid = 0;
 		battmgr->online_mask = 0;
-		battmgr->connector_source = false;
+		WRITE_ONCE(battmgr->connector_source, false);
 		qcom_battmgr_connector_gate(battmgr);
+		qcom_battmgr_charge_wake(battmgr, false, 0);
 		atomic_inc(&battmgr->service_generation);
 		WRITE_ONCE(battmgr->liuqin_thermal_level, -1);
 	}
@@ -2557,6 +2910,8 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 		return ret;
 	INIT_WORK(&battmgr->online_work, qcom_battmgr_check_online);
 	INIT_WORK(&battmgr->enable_work, qcom_battmgr_enable_worker);
+	INIT_WORK(&battmgr->xm_notify_work, qcom_battmgr_xm_notify_worker);
+	INIT_DELAYED_WORK(&battmgr->refresh_work, qcom_battmgr_sm8475_refresh_worker);
 	mutex_init(&battmgr->lock);
 	init_completion(&battmgr->ack);
 	battmgr->liuqin_thermal_level = -1;
@@ -2588,12 +2943,21 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 			return dev_err_probe(dev, PTR_ERR(battmgr->wls_psy),
 					     "failed to register wireless charing power supply\n");
 	} else {
-		battmgr->bat_psy = devm_power_supply_register(dev, &sm8350_bat_psy_desc, &psy_cfg);
+		const struct power_supply_desc *psy_desc = &sm8350_bat_psy_desc;
+
+		if (battmgr->variant == QCOM_BATTMGR_SM8475)
+			psy_desc = &sm8475_bat_psy_desc;
+
+		battmgr->bat_psy = devm_power_supply_register(dev, psy_desc, &psy_cfg);
 		if (IS_ERR(battmgr->bat_psy))
 			return dev_err_probe(dev, PTR_ERR(battmgr->bat_psy),
 					     "failed to register battery power supply\n");
 
-		battmgr->usb_psy = devm_power_supply_register(dev, &sm8350_usb_psy_desc, &psy_cfg_supply);
+		if (battmgr->variant == QCOM_BATTMGR_SM8475)
+			psy_desc = &sm8475_usb_psy_desc;
+		else
+			psy_desc = &sm8350_usb_psy_desc;
+		battmgr->usb_psy = devm_power_supply_register(dev, psy_desc, &psy_cfg_supply);
 		if (IS_ERR(battmgr->usb_psy))
 			return dev_err_probe(dev, PTR_ERR(battmgr->usb_psy),
 					     "failed to register USB power supply\n");
@@ -2605,12 +2969,24 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	}
 
 	spin_lock_init(&battmgr->connector_lock);
+	spin_lock_init(&battmgr->charge_lock);
 	INIT_DELAYED_WORK(&battmgr->connector_work, qcom_battmgr_connector_worker);
 	if (battmgr->variant == QCOM_BATTMGR_SM8475) {
 		battmgr->connector_enabled = IS_REACHABLE(CONFIG_IIO) &&
 			device_property_match_string(dev, "io-channel-names", "connector-temp") >= 0;
 		if (!battmgr->connector_enabled && of_machine_is_compatible("xiaomi,liuqin"))
 			dev_err(dev, "connector temperature channel unavailable\n");
+
+		/* Unregistered only after devres has released the GLINK client. */
+		if (IS_ENABLED(CONFIG_PM_SLEEP)) {
+			battmgr->charge_ws = wakeup_source_register(dev, "qcom-battmgr-charge");
+			if (!battmgr->charge_ws)
+				return -ENOMEM;
+			ret = devm_add_action_or_reset(dev, qcom_battmgr_charge_wake_remove,
+						       battmgr);
+			if (ret)
+				return ret;
+		}
 	}
 
 	battmgr->client = devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_BATTMGR,
@@ -2624,8 +3000,10 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	if (ret)
 		return ret;
 
-	if (battmgr->connector_enabled) {
+	/* The connector gate and the charging wakeup source both follow OTG. */
+	if (battmgr->variant == QCOM_BATTMGR_SM8475)
 		pmic_glink_client_watch_source_ports(battmgr->client, qcom_battmgr_source_changed);
+	if (battmgr->connector_enabled) {
 		ret = devm_device_add_group(dev, &connector_test_group);
 		if (ret)
 			return ret;
@@ -2637,7 +3015,11 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 		ret = devm_device_add_group(dev, &qcom_battmgr_raw_group);
 		if (ret)
 			return ret;
-		return devm_device_add_group(dev, &qcom_battmgr_xiaomi_group);
+		ret = devm_device_add_group(dev, &qcom_battmgr_xiaomi_group);
+		if (ret)
+			return ret;
+
+		queue_delayed_work(system_freezable_wq, &battmgr->refresh_work, 0);
 	}
 
 	return 0;
@@ -2653,9 +3035,14 @@ static struct auxiliary_driver qcom_battmgr_driver = {
 	.name = "pmic_glink_power_supply",
 	.probe = qcom_battmgr_probe,
 	.id_table = qcom_battmgr_id_table,
+	.driver.pm = pm_sleep_ptr(&qcom_battmgr_pm_ops),
 };
 
 module_auxiliary_driver(qcom_battmgr_driver);
 
 MODULE_DESCRIPTION("Qualcomm PMIC GLINK battery manager driver");
 MODULE_LICENSE("GPL");
+
+#if IS_ENABLED(CONFIG_BATTERY_QCOM_BATTMGR_KUNIT_TEST)
+#include "qcom_battmgr_test.c"
+#endif

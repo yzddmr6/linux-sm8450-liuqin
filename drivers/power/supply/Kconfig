@@ -214,6 +214,20 @@ config BATTERY_QCOM_BATTMGR
 	  which is used on modern Qualcomm platforms to provide battery and
 	  power supply information.
 
+config BATTERY_QCOM_BATTMGR_KUNIT_TEST
+	bool "KUnit tests for the Qualcomm PMIC GLINK battery manager" if !KUNIT_ALL_TESTS
+	depends on BATTERY_QCOM_BATTMGR=y && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Build KUnit tests for the SM8475 property protocol into the driver:
+	  the firmware property ids, the battery units, the fuel-gauge
+	  refresh, the vendor change event, the USB input current limit and
+	  type, and the wired-charging wakeup source classification. The tests
+	  replace the GLINK transport with a fake firmware and need no
+	  hardware.
+
+	  If unsure, say N.
+
 config BATTERY_OLPC
 	tristate "One Laptop Per Child battery"
 	depends on OLPC_EC
