@@ -1239,18 +1239,12 @@
 	 * 183 places, including the one command that encodes this panel's
 	 * porches, 3b 03 d8 1a 0a 0a 00, where 0xd8 is VBP+2 and 0x1a is VFP.
 	 *
-	 * reset-gpios is GPIO_ACTIVE_HIGH and that is not a copy of yudi.
-	 * pipa_reset() (:48-57) drives the line 0,1,0,1 with 12 ms between each
-	 * step and *ends on 1*, whereas yudi_reset() (:59-67) ends on 0. Only
-	 * one polarity makes each of them leave the panel out of reset, and for
-	 * pipa_reset() that is active-high: it then produces low, high, low,
-	 * high, which is the vendor's own reset waveform
+	 * NT36532 RESX is active low, as on yudi. pipa_reset() asserts and
+	 * releases it twice with 12 ms between steps, which on the wire is low,
+	 * high, low, high: the vendor's own reset waveform
 	 * qcom,mdss-dsi-reset-sequence = <0 10 1 3 0 3 1 15> (:26205) in shape,
-	 * ending deasserted, differing only in the dwell times. With
-	 * GPIO_ACTIVE_LOW the same helper inverts to high, low, high, low and
-	 * leaves NT36532 nRESET asserted for the whole init sequence and PPS --
-	 * every DSI write would still report success and the panel would stay
-	 * black with nothing in dmesg to explain it.
+	 * ending released, differing only in the dwell times. Power-off asserts
+	 * it before the supplies go, as the vendor's dsi_panel_power_off() does.
 	 *
 	 * No te-gpios: this is video mode, so there is no tear-effect
 	 * handshake. The vendor wires TE to gpio86 with the mdp_vsync function
@@ -1265,7 +1259,7 @@
 		dvddbuck-supply = <&display_panel_dvdd_buck>;
 		dvddldo-supply = <&display_panel_dvdd_ldo>;
 
-		reset-gpios = <&tlmm 0 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&tlmm 0 GPIO_ACTIVE_LOW>;
 		backlight = <&backlight>;
 
 		pinctrl-0 = <&sde_dsi_active>;

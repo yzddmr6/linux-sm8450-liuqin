@@ -50,15 +50,21 @@ static struct mipi_dsi_device *nt36532_cmd_dsi(struct nt36532 *ctx)
 	return ctx->dsi[1] ?: ctx->dsi[0];
 }
 
+/*
+ * RESX is active low. Written in logical levels like yudi_reset() and the
+ * rest of the driver (1 = held in reset), so unprepare() and the prepare()
+ * error path, which assert the line, keep the panel in reset instead of
+ * releasing it: pulse, release, pulse, release.
+ */
 static void pipa_reset(struct nt36532 *ctx)
 {
-	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
-	usleep_range(12000, 13000);
 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
 	usleep_range(12000, 13000);
 	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
 	usleep_range(12000, 13000);
 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+	usleep_range(12000, 13000);
+	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
 	usleep_range(12000, 13000);
 }
 
