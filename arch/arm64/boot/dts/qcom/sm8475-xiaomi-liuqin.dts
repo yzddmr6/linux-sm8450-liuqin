@@ -94,15 +94,14 @@
 	 *   display_gpio_regulator_vsp        :33137  gpio 66  5.5 V, ramp 233 us
 	 *   display_gpio_regulator_vsn        :33149  gpio 53  5.5 V, ramp 233 us
 	 *
-	 * vsp/vsn are not panel rails in the usual sense: gpio 66 and gpio 53 are
-	 * the KTZ8866's own ENP and ENN pins (:12676-12677), i.e. the enables for
-	 * its positive and negative LCD bias outputs. That is why they are
-	 * consumed by backlight@11 as vddpos/vddneg rather than by the panel.
-	 *
-	 * regulator-always-on throughout, as on yudi: nothing here can be
-	 * sequenced off safely while the bootloader's splash is still scanning
-	 * out, and the panel driver's unprepare path would otherwise drop rails
-	 * the earlycon framebuffer still depends on.
+	 * gpio 66 and gpio 53 are the KTZ8866's own ENP and ENN pins
+	 * (:12676-12677), the enables for its positive and negative LCD bias
+	 * outputs, and the vendor sequences them as the panel's vsp and vsn
+	 * supplies (dsi_panel_pwr_supply_M81, :33045-33100): up iovdd, dvddbuck,
+	 * dvddldo, vsp, vsn, down in reverse, with reset asserted first. So do
+	 * we. regulator-boot-on keeps the bootloader's splash lit until the
+	 * panel driver takes them over; no regulator-always-on, which kept the
+	 * core and bias up through every power-down and across reboots.
 	 */
 	backlight_gpio_regulator_vsn: backlight-gpio-reg-vsn {
 		compatible = "regulator-fixed";
@@ -113,7 +112,6 @@
 		gpio = <&tlmm 53 GPIO_ACTIVE_HIGH>;
 		enable-active-high;
 		regulator-boot-on;
-		regulator-always-on;
 	};
 
 	backlight_gpio_regulator_vsp: backlight-gpio-reg-vsp {
@@ -125,7 +123,6 @@
 		gpio = <&tlmm 66 GPIO_ACTIVE_HIGH>;
 		enable-active-high;
 		regulator-boot-on;
-		regulator-always-on;
 	};
 
 	display_panel_dvdd_buck: display-panel-dvdd-buck {
@@ -136,7 +133,6 @@
 		gpio = <&tlmm 2 GPIO_ACTIVE_HIGH>;
 		enable-active-high;
 		regulator-boot-on;
-		regulator-always-on;
 	};
 
 	display_panel_dvdd_ldo: display-panel-dvdd-ldo {
@@ -147,7 +143,6 @@
 		gpio = <&tlmm 93 GPIO_ACTIVE_HIGH>;
 		enable-active-high;
 		regulator-boot-on;
-		regulator-always-on;
 	};
 
 	/*
@@ -754,8 +749,9 @@
 /*
  * The backlight is a Kinetic KTZ8866 at address 0x11 on QUPv3 wrapper 0's
  * second serial engine -- the vendor's i2c@984000 (abl-final-fdt.dts:12657),
- * which is what sm8450.dtsi:1364 calls i2c1. Address, enable line and the
- * ENP/ENN rails all come from the vendor's ktz8866@11 (:12674-12681).
+ * which is what sm8450.dtsi:1364 calls i2c1. Address and enable line come
+ * from the vendor's ktz8866@11 (:12674-12681); its ENP/ENN rails are the
+ * panel's vsp/vsn supplies, sequenced by the panel like the vendor does.
  *
  * No clock-frequency: sm8450.dtsi does not set one, so i2c-qcom-geni falls
  * back to 100 kHz, which is what yudi runs this same chip on this same bus at.
@@ -783,9 +779,6 @@
 	backlight: backlight@11 {
 		compatible = "kinetic,ktz8866";
 		reg = <0x11>;
-
-		vddpos-supply = <&backlight_gpio_regulator_vsp>;
-		vddneg-supply = <&backlight_gpio_regulator_vsn>;
 
 		enable-gpios = <&tlmm 6 GPIO_ACTIVE_HIGH>;
 
@@ -1258,6 +1251,8 @@
 		vddio-supply = <&pm8350c_l2>;
 		dvddbuck-supply = <&display_panel_dvdd_buck>;
 		dvddldo-supply = <&display_panel_dvdd_ldo>;
+		vsp-supply = <&backlight_gpio_regulator_vsp>;
+		vsn-supply = <&backlight_gpio_regulator_vsn>;
 
 		reset-gpios = <&tlmm 0 GPIO_ACTIVE_LOW>;
 		backlight = <&backlight>;

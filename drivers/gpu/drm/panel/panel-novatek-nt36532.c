@@ -19,13 +19,33 @@
 #include <drm/display/drm_dsc.h>
 #include <drm/display/drm_dsc_helper.h>
 
+/*
+ * Supplies in the vendor's power-up order (dsi_panel_pwr_supply_M81), each
+ * with its qcom,supply-post-on-sleep and qcom,supply-post-off-sleep in ms.
+ * Power-down runs the table backwards. vsp/vsn are the KTZ8866's ENP/ENN,
+ * the panel's +-5.5 V bias; boards that do not describe them get dummies.
+ */
+static const struct {
+	const char *name;
+	unsigned int post_on_ms;
+	unsigned int post_off_ms;
+} nt36532_supplies[] = {
+	{ "vddio",    2, 2 },
+	{ "dvddbuck", 0, 2 },
+	{ "dvddldo",  2, 0 },
+	{ "vsp",      2, 2 },
+	{ "vsn",      2, 2 },
+};
+
 struct nt36532 {
 	struct drm_panel panel;
 	struct mipi_dsi_device *dsi[2];
 	const struct panel_desc *desc;
 	struct drm_dsc_config dsc;
-	struct regulator_bulk_data supplies[3];
+	struct regulator_bulk_data supplies[ARRAY_SIZE(nt36532_supplies)];
 	struct gpio_desc *reset_gpio;
+	/* the supplies are ours: the bootloader's power-up has been undone */
+	bool owns_power;
 };
 
 static inline struct nt36532 *
@@ -76,6 +96,41 @@ static void yudi_reset(struct nt36532 *ctx)
 	usleep_range(3000, 4000);
 	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
 	usleep_range(15000, 16000);
+}
+
+static void nt36532_sleep_ms(unsigned int ms)
+{
+	if (ms)
+		usleep_range(ms * 1000, ms * 1000 + 1000);
+}
+
+static int nt36532_power_on(struct nt36532 *ctx)
+{
+	int i, ret;
+
+	for (i = 0; i < ARRAY_SIZE(nt36532_supplies); i++) {
+		ret = regulator_enable(ctx->supplies[i].consumer);
+		if (ret < 0) {
+			while (--i >= 0)
+				regulator_disable(ctx->supplies[i].consumer);
+			return ret;
+		}
+		nt36532_sleep_ms(nt36532_supplies[i].post_on_ms);
+	}
+
+	return 0;
+}
+
+static void nt36532_power_off(struct nt36532 *ctx)
+{
+	int i;
+
+	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+
+	for (i = ARRAY_SIZE(nt36532_supplies) - 1; i >= 0; i--) {
+		regulator_disable(ctx->supplies[i].consumer);
+		nt36532_sleep_ms(nt36532_supplies[i].post_off_ms);
+	}
 }
 
 static int pipa_init_sequence(struct nt36532 *ctx)
@@ -534,7 +589,28 @@ static int nt36532_prepare(struct drm_panel *panel)
 	struct drm_dsc_picture_parameter_set pps;
 	int ret;
 
-	ret = regulator_bulk_enable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
+	/*
+	 * The bootloader hands the module over powered and scanning out its
+	 * splash, which the regulator core does not know about: the first
+	 * enable would be a no-op and the panel would only ever see a reset
+	 * pulse with every supply left up. On some boots that leaves the TDDI
+	 * unable to come up (its touch controller never reaches ReK), while a
+	 * prepare that follows a normal power-down comes up. Take the supplies
+	 * over and power the panel down first. (Candidate: on the device this
+	 * alone did not prevent it; the running panel is not put to sleep
+	 * before it is taken down, unlike every other power-down.)
+	 */
+	if (!ctx->owns_power) {
+		ret = nt36532_power_on(ctx);
+		if (ret < 0) {
+			dev_err(dev, "Failed to take over regulators: %d\n", ret);
+			return ret;
+		}
+		nt36532_power_off(ctx);
+		ctx->owns_power = true;
+	}
+
+	ret = nt36532_power_on(ctx);
 	if (ret < 0) {
 		dev_err(dev, "Failed to enable regulators: %d\n", ret);
 		return ret;
@@ -575,8 +651,7 @@ static int nt36532_prepare(struct drm_panel *panel)
 	return 0;
 
 fail:
-	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
-	regulator_bulk_disable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
+	nt36532_power_off(ctx);
 	return ret;
 }
 
@@ -633,8 +708,7 @@ static int nt36532_unprepare(struct drm_panel *panel)
 	if (ctx->dsi[1])
 		ctx->dsi[1]->mode_flags &= ~MIPI_DSI_MODE_LPM;
 
-	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
-	regulator_bulk_disable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
+	nt36532_power_off(ctx);
 
 	return 0;
 }
@@ -668,9 +742,8 @@ static int nt36532_probe(struct mipi_dsi_device *dsi)
 	if (!ctx)
 		return -ENOMEM;
 
-	ctx->supplies[0].supply = "vddio";
-	ctx->supplies[1].supply = "dvddbuck";
-	ctx->supplies[2].supply = "dvddldo";
+	for (i = 0; i < ARRAY_SIZE(nt36532_supplies); i++)
+		ctx->supplies[i].supply = nt36532_supplies[i].name;
 	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(ctx->supplies),
 				      ctx->supplies);
 	if (ret < 0)
