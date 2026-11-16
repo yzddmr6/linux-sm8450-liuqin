@@ -267,6 +267,15 @@ config VIDEO_IMX415
 	  To compile this driver as a module, choose M here: the
 	  module will be called imx415.
 
+config VIDEO_IMX596
+	tristate "Sony IMX596 sensor support"
+	select V4L2_CCI_I2C
+	help
+	  This is a V4L2 sensor driver for the Sony IMX596 CMOS image sensor.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called imx596.
+
 config VIDEO_MAX9271_LIB
 	tristate
 
